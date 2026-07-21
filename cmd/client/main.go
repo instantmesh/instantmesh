@@ -70,16 +70,15 @@ func main() {
 	stunAddr := flag.String("stun", "", "STUN サーバー host:port（指定時に WAN を発見し peer_info を広告）")
 	relay := flag.Bool("relay", true, "P2P直通に失敗したらリレーへ自動フォールバックする（要 -tunnel）")
 	guiAddr := flag.String("gui-addr", "127.0.0.1:8088", "GUI モードで待ち受ける localhost アドレス（外部公開しない）")
-	cognitoDomain := flag.String("cognito-domain", "", "Cognito Hosted UI ベース URL（例 https://<prefix>.auth.<region>.amazoncognito.com）。client-id とともに指定するとホストは PKCE サインインで ID トークンを取得する（未指定は -account を使用）")
-	cognitoClientID := flag.String("cognito-client-id", "", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）")
-	cognitoRedirect := flag.String("cognito-redirect", "http://localhost:53682/callback", "PKCE 認可コードのループバック受け取り先（Cognito に登録した URL と一致させる）")
+	cognitoDomain := flag.String("cognito-domain", "https://instantmesh-net.auth.ap-northeast-1.amazoncognito.com", "Cognito Hosted UI ベース URL。既定は公開サーバーのユーザープール。ホストは PKCE サインインで ID トークンを取得する。ローカルの DevAuthenticator サーバーに繋ぐ場合は空文字を指定して無効化する（その場合は -account を Bearer に使用）")
+	cognitoClientID := flag.String("cognito-client-id", "1mhe007gbarnh3u2f0dkglm8ep", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）。既定は公開サーバーのアプリクライアント")
 	cognitoScope := flag.String("cognito-scope", "openid", "要求スコープ（カンマ区切り）")
 	flag.Parse()
 
 	cognito := cognitoConfig{
 		domain:      *cognitoDomain,
 		clientID:    *cognitoClientID,
-		redirectURI: *cognitoRedirect,
+		redirectURI: defaultCognitoRedirect, // Cognito 登録値に固定（フラグ廃止）
 		scopes:      splitScopes(*cognitoScope),
 	}
 
