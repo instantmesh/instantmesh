@@ -8,6 +8,10 @@
 /dist/
 /build/
 
+# 例外: Windows クライアントへ go:embed する Wintun ドライバ DLL（署名済みプリビルド・
+# 再配布可）。上の *.dll ルールで無視されるため明示的に追跡対象へ戻す。
+!cmd/client/wintun.dll
+
 # Test binaries and coverage
 *.test
 *.out

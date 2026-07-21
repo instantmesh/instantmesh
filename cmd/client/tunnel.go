@@ -46,6 +46,12 @@ type Tunnel struct {
 // ifName は OS により制約がある（Linux: 任意名、macOS: "utun"/"utunN"、Windows: 任意名で Wintun）。
 // 初回は管理者/root 権限が必要。
 func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
+	// Windows では wireguard-go が仮想NIC作成時に wintun.dll を実行時ロードする。埋め込んだ
+	// dll を実行ファイル隣へ配置してから CreateTUN する（非 Windows では no-op）。これにより
+	// 配布物は単一 exe で完結する。
+	if err := ensureWintun(); err != nil {
+		return nil, fmt.Errorf("wintun 準備: %w", err)
+	}
 	tunDev, err := tun.CreateTUN(ifName, device.DefaultMTU)
 	if err != nil {
 		return nil, fmt.Errorf("tun 作成: %w", err)
