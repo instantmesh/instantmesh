@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -360,7 +361,13 @@ func (s *guiServer) getClient() *signalclient.Client {
 // （稼働中セッションも baseCtx 経由でキャンセルされる）。
 func runGUI(ctx context.Context, addr string, opts guiOptions) error {
 	gs := newGUIServer(ctx, opts)
-	srv := &http.Server{Addr: addr, Handler: gs.handler()}
+	srv := &http.Server{Handler: gs.handler()}
+
+	// リスナーを先に確立してからブラウザを開く（Serve 前に開くと接続に失敗しうるため）。
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -369,8 +376,14 @@ func runGUI(ctx context.Context, addr string, opts guiOptions) error {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	slog.Info("GUI サーバー起動（ブラウザで開いてください）", "url", "http://"+addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	url := "http://" + ln.Addr().String()
+	slog.Info("GUI サーバー起動", "url", url)
+	// 既定のブラウザで自動的に開く（ベストエフォート・失敗してもサーバーは継続）。
+	if err := openBrowser(url); err != nil {
+		slog.Warn("ブラウザの自動起動に失敗しました。上記 URL を手動で開いてください", "url", url, "err", err)
+	}
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
