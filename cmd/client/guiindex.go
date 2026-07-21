@@ -52,7 +52,7 @@ li.row { display: flex; justify-content: space-between; align-items: center; gap
 </style>
 </head>
 <body>
-<header><h1>InstantMesh</h1><span id="conn" class="muted"></span></header>
+<header><h1>InstantMesh</h1><span id="conn" class="muted"></span><button id="btn-quit" class="danger" style="margin-left:auto">アプリを終了</button></header>
 <div id="err" hidden></div>
 <main id="app"></main>
 <script>
@@ -217,7 +217,20 @@ async function poll() {
     render(s);
   } catch (e) { /* 一時的な取得失敗は無視して次のポーリングで回復する */ }
 }
-setInterval(poll, 1000);
+
+// アプリ終了: サーバーへ /api/quit を送り、ポーリングを止めて終了画面へ切り替える。
+// このポーリング（/api/state）自体がサーバー側のハートビートなので、タブを閉じただけでも
+// 一定時間後にサーバーは自動終了する。終了ボタンは即時・明示の停止手段。
+async function quitApp() {
+  if (!confirm('InstantMesh を終了します。よろしいですか？')) return;
+  clearInterval(pollTimer);
+  try { await fetch('/api/quit', {method: 'POST'}); } catch (e) { /* 終了に伴う切断は無視 */ }
+  document.body.innerHTML = '<main><section class="card"><h2>アプリを終了しました</h2>' +
+    '<p class="muted">このタブを閉じてください。</p></section></main>';
+}
+document.getElementById('btn-quit').onclick = quitApp;
+
+var pollTimer = setInterval(poll, 1000);
 poll();
 </script>
 </body>
