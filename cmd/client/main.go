@@ -22,10 +22,10 @@
 // メッシュIP をインターフェースに付与し、メッシュ /24 を当該インターフェース経由にルート設定する
 // （pkg/netcfg で算出、OS 依存の適用は configureLink）。要管理者/root 権限。
 //
-// 使い方:
+// 使い方（-tunnel/-stun は既定で有効・要管理者権限。権限なしでシグナリングのみ確認するときは -tunnel=false）:
 //
-//	client -mode host  -server ws://HOST:8080/ws -account <token> [-tunnel -stun stun.l.google.com:19302]
-//	client -mode guest -invite "instantmesh://join?..." [-nick alice -tunnel -stun ...]
+//	client -mode host  -server ws://HOST:8080/ws -account <token>
+//	client -mode guest -invite "instantmesh://join?..." [-nick alice]
 package main
 
 import (
@@ -65,9 +65,9 @@ func main() {
 	inviteURL := flag.String("invite", "", "招待リンク（guest）")
 	duration := flag.Int64("duration", 3600, "ルーム制限時間（秒・host）")
 	auto := flag.Bool("auto-approve", false, "参加申請を自動承認する（host・デモ用）。既定は手動承認（標準入力に approve/reject を入力）")
-	useTunnel := flag.Bool("tunnel", false, "wireguard-go 仮想NICを起動する（要管理者権限）")
+	useTunnel := flag.Bool("tunnel", true, "wireguard-go 仮想NICを起動する（既定で有効・要管理者権限）。権限なしでシグナリングのみ確認するときは -tunnel=false")
 	ifname := flag.String("ifname", "wg-mesh", "仮想NICのインターフェース名（Linux 任意/macOS は utun）")
-	stunAddr := flag.String("stun", "", "STUN サーバー host:port（指定時に WAN を発見し peer_info を広告）")
+	stunAddr := flag.String("stun", "stun.l.google.com:19302", "STUN サーバー host:port（既定で WAN を発見し peer_info を広告。無効化は -stun= 空文字）")
 	relay := flag.Bool("relay", true, "P2P直通に失敗したらリレーへ自動フォールバックする（要 -tunnel）")
 	guiAddr := flag.String("gui-addr", "127.0.0.1:8088", "GUI モードで待ち受ける localhost アドレス（外部公開しない）")
 	cognitoDomain := flag.String("cognito-domain", "https://instantmesh-net.auth.ap-northeast-1.amazoncognito.com", "Cognito Hosted UI ベース URL。既定は公開サーバーのユーザープール。ホストは PKCE サインインで ID トークンを取得する。ローカルの DevAuthenticator サーバーに繋ぐ場合は空文字を指定して無効化する（その場合は -account を Bearer に使用）")
