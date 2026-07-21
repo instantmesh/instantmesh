@@ -32,13 +32,13 @@ go run ./cmd/server -addr :8080
 
 # ホスト（ルーム作成 → 招待リンク/SAS 出力 → 参加を自動承認）
 # ローカルの DevAuthenticator サーバーに繋ぐため -cognito-domain= で Cognito を無効化する
-go run ./cmd/client -mode host  -server ws://localhost:8080/ws -cognito-domain= -account dev-account [-tunnel -stun stun.l.google.com:19302]
+go run ./cmd/client -mode host  -server ws://localhost:8080/ws -cognito-domain= -account dev-account  # -tunnel/-stun は既定有効(要管理者)。権限なしでシグナリングのみは -tunnel=false
 
 # ゲスト（招待リンクから参加 → 帯域外MITM照合）
-go run ./cmd/client -mode guest -invite "instantmesh://join?..." -nick alice [-tunnel -stun ...]
+go run ./cmd/client -mode guest -invite "instantmesh://join?..." -nick alice  # 同上（-tunnel/-stun 既定有効）
 ```
 
-`-tunnel` は wireguard-go 仮想NICを起動する（要管理者/root 権限）。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
+`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
 
 ## アーキテクチャ
 
