@@ -58,8 +58,8 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "", "host または guest")
-	server := flag.String("server", "ws://localhost:8080/ws", "シグナリングサーバー WebSocket URL（host）")
+	mode := flag.String("mode", "gui", "host / guest / gui（既定 gui。省略時は GUI モードで起動）")
+	server := flag.String("server", "wss://s1.instantmesh.net/ws", "シグナリングサーバー WebSocket URL（host。既定は公開サーバー。ローカル検証は ws://localhost:8080/ws を指定）")
 	account := flag.String("account", "dev-account", "ホスト認証トークン（host）")
 	nick := flag.String("nick", "guest", "ニックネーム（guest）")
 	inviteURL := flag.String("invite", "", "招待リンク（guest）")
