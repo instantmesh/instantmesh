@@ -12,6 +12,10 @@
 # 再配布可）。上の *.dll ルールで無視されるため明示的に追跡対象へ戻す。
 !cmd/client/wintun.dll
 
+# Windows リソースオブジェクト（CI が rsrc でマニフェストから生成し windows ビルドへ
+# リンクする。生成物のため追跡しない）
+*.syso
+
 # Test binaries and coverage
 *.test
 *.out
