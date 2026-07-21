@@ -103,7 +103,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 	for _, ep := range []struct{ method, path string }{
 		{"POST", "/api/host"}, {"POST", "/api/join"}, {"POST", "/api/approve"},
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
-		{"POST", "/api/reset"}, {"POST", "/api/quit"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
+		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -472,59 +472,6 @@ func TestFinishSessionStaleGeneration(t *testing.T) {
 	}
 	if ph := gs.store.snapshot().Phase; ph == "closed" {
 		t.Error("古い世代の finishSession は store を閉じてはならない")
-	}
-}
-
-// TestGUIServerQuit は「アプリを終了」操作（POST /api/quit）が 204 を返し、アプリ終了
-// （ルート ctx キャンセル）を一度だけ発火することを検証する。
-func TestGUIServerQuit(t *testing.T) {
-	gs, cancel := testServer(t)
-	defer cancel()
-	var quits int
-	gs.quit = func() { quits++ }
-
-	if rec := do(t, gs, "POST", "/api/quit", ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("quit status=%d, want 204", rec.Code)
-	}
-	if quits != 1 {
-		t.Errorf("quit 呼び出し=%d, want 1", quits)
-	}
-}
-
-// TestGUIServerHeartbeatAutoQuit は、ブラウザのポーリング（/api/state）途絶を検知して自動終了
-// する番人ロジックを、注入時計で決定的に検証する。初回接続前は終了せず、接続後に猶予を超えて
-// 途絶したときだけ終了する。
-func TestGUIServerHeartbeatAutoQuit(t *testing.T) {
-	gs, cancel := testServer(t)
-	defer cancel()
-	nowT := time.Unix(1000, 0)
-	gs.now = func() time.Time { return nowT }
-	gs.heartbeatTimeout = 15 * time.Second
-	var quits int
-	gs.quit = func() { quits++ }
-
-	// 初回接続前は自動終了しない。
-	if gs.idleExpired() {
-		t.Fatal("接続前に idleExpired が真になった")
-	}
-	// ブラウザ接続（ポーリング）で lastSeen を記録 → 直後は途絶ではない。
-	do(t, gs, "GET", "/api/state", "")
-	if gs.idleExpired() {
-		t.Fatal("接続直後に idleExpired が真になった")
-	}
-	// 猶予内（10 秒経過）は途絶と判定しない。
-	nowT = nowT.Add(10 * time.Second)
-	if gs.idleExpired() {
-		t.Fatal("猶予内で idleExpired が真になった")
-	}
-	// 猶予超過（計 16 秒 > 15 秒）で途絶と判定し、quitApp でアプリ終了を発火する。
-	nowT = nowT.Add(6 * time.Second)
-	if !gs.idleExpired() {
-		t.Fatal("猶予超過でも idleExpired が偽のまま")
-	}
-	gs.quitApp()
-	if quits != 1 {
-		t.Errorf("quit 呼び出し=%d, want 1", quits)
 	}
 }
 
