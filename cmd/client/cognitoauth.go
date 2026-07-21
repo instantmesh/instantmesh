@@ -23,6 +23,11 @@ const (
 	cognitoVerifierBytes   = 32              // code_verifier の乱数バイト数（RFC 7636 推奨帯）
 	cognitoStateBytes      = 16              // state（CSRF 対策乱数）のバイト数
 	cognitoCallbackTimeout = 3 * time.Minute // ブラウザ認証のコールバック待ちタイムアウト
+
+	// defaultCognitoRedirect は PKCE 認可コードのループバック受け取り先。Cognito アプリクライアント
+	// に登録した callback URL（infra 側 desktopCallbackPort=53682）と一致させる固定値。不一致だと
+	// Cognito が redirect_uri_mismatch を返し、ユーザーが変更する余地もないためフラグにはしない。
+	defaultCognitoRedirect = "http://localhost:53682/callback"
 )
 
 // サインインの失敗を表すセンチネルエラー。
