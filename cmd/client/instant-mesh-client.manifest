@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Windows クライアント exe へ埋め込むアプリケーションマニフェスト。
+  requireAdministrator を指定することで、右クリック「管理者として実行」をせずとも
+  ダブルクリック等の通常起動で UAC の昇格ダイアログが自動的に出るようにする。
+  本クライアントは wireguard-go の仮想NIC(Wintun)作成・netsh によるIP/ルート設定に
+  管理者権限が必須のため、常時昇格を要求する。
+
+  このマニフェストは直接ビルドには使われず、CI（.github/workflows/ci.yml の build ジョブ）で
+  rsrc により COFF リソース（cmd/client/rsrc_windows_amd64.syso）へ変換され、windows/amd64
+  ビルド時にリンカが自動リンクする。.syso は生成物のためコミットしない（.gitignore 参照）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

@@ -107,6 +107,15 @@ jobs:
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
           out="dist/${GOOS}-${GOARCH}"
           mkdir -p "$out"
+          # Windows クライアントには UAC 昇格を要求するアプリケーションマニフェストを埋め込む。
+          # rsrc でマニフェストを COFF リソース(rsrc_windows_amd64.syso)へ変換して cmd/client に
+          # 置くと、windows/amd64 ビルド時にリンカが自動リンクする（ダブルクリック起動でも
+          # 管理者昇格ダイアログが出るようになる）。サーバーには埋め込まない。
+          if [ "$GOOS" = "windows" ] && [ "$GOARCH" = "amd64" ]; then
+            go run github.com/akavel/rsrc@v0.10.2 \
+              -manifest cmd/client/instant-mesh-client.manifest \
+              -arch amd64 -o cmd/client/rsrc_windows_amd64.syso
+          fi
           go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-server${ext}" ./cmd/server
           go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-client${ext}" ./cmd/client
 
