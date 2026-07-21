@@ -58,6 +58,11 @@ import (
 )
 
 func main() {
+	// Windows GUI サブシステム（-H windowsgui）ビルドで、コンソールから起動された場合だけ
+	// 親コンソールへ入出力を接続する（ダブルクリック起動は無音）。非 Windows では no-op。
+	// フラグ解析や出力より前に一度だけ呼ぶ。
+	attachParentConsole()
+
 	mode := flag.String("mode", "gui", "host / guest / gui（既定 gui。省略時は GUI モードで起動）")
 	server := flag.String("server", "wss://s1.instantmesh.net/ws", "シグナリングサーバー WebSocket URL（host。既定は公開サーバー。ローカル検証は ws://localhost:8080/ws を指定）")
 	account := flag.String("account", "dev-account", "ホスト認証トークン（host）")

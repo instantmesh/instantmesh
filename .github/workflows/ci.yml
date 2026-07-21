@@ -119,8 +119,14 @@ jobs:
               -manifest cmd/client/instant-mesh-client.manifest \
               -arch amd64 -o cmd/client/rsrc_windows_amd64.syso
           fi
+          # Windows クライアントは GUI サブシステムでリンクし、ダブルクリック起動時に
+          # コンソールウィンドウを開かないようにする（既定の gui モードはブラウザ UI で完結）。
+          # コンソールから起動した場合は attachconsole_windows.go が親コンソールへ入出力を
+          # 接続するため CLI（-mode host/guest）も引き続き使える。サーバーは据え置き（console）。
+          client_ldflags="-s -w"
+          if [ "$GOOS" = "windows" ]; then client_ldflags="$client_ldflags -H windowsgui"; fi
           go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-server${ext}" ./cmd/server
-          go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-client${ext}" ./cmd/client
+          go build -trimpath -ldflags="$client_ldflags" -o "$out/instant-mesh-client${ext}" ./cmd/client
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
