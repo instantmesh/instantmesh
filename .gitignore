@@ -1,0 +1,35 @@
+# Compiled binaries / build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/build/
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.*
+
+# 誤って生成されるスクラッチファイル（開発サーバーのテスト実行コマンドが末尾の "2" を
+# 第2出力先として作ってしまう事故対策。恒久対処は実行コマンド側で末尾 "2" を除去すること）
+/2
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency vendor dir (kept out until we introduce modules)
+/vendor/
+
+# IDE / editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code の開発者ローカル設定（機器ごとの許可リスト等・誤コミット防止）
+.claude/settings.local.json

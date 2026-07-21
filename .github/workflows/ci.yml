@@ -1,0 +1,163 @@
+name: CI/CD
+
+# CI: push / PR ごとに build・vet・脆弱性スキャン・テスト（race 検出・カバレッジ）を実行する。
+# CD: main へのマージ（push）時とバージョンタグ(v*)の push 時に、テスト成功後に各プラットフォーム
+#     向けバイナリをビルドする（build ジョブ）。タグ push 時はさらに GitHub Release として公開する
+#     （release ジョブ）。infra/ の user-data はこのリリース資産の安定 URL から arm64 サーバー
+#     バイナリを取得する。
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # サプライチェーン対策（OSSF Scorecard 推奨）: アクションは可変タグではなくコミット SHA で
+      # ピン止めする。タグ乗っ取り型攻撃を防ぎ、末尾コメントで人間可読なバージョンを併記する。
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # 最新安定版の Go を使う。go.mod の go ディレクティブは「最低要求バージョン」であり、
+          # CI は stdlib のセキュリティパッチを取り込んだ最新版でビルド/テスト/govulncheck する。
+          # 固定パッチ版に追随すると、そのバージョンの stdlib の既知脆弱性を govulncheck が
+          # 到達可能として検出し CI が失敗するため（INFO-2）。
+          go-version: "stable"
+          cache: true
+
+      - name: Download & verify modules
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      # 継続的な脆弱性スキャン。到達可能（実際に呼び出される）な既知脆弱性のみを検出するため
+      # 誤検知が少ない。新規の脆弱依存の混入を PR/push ごとに検知する（INFO-2）。
+      - name: Vulnerability scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Build
+        run: go build ./...
+
+      # ローカルに Go が無いため、OS 依存アダプタ（cmd/client の linkconfig_<os>.go 等）の
+      # コンパイル崩れを CI で検知する。ランナーは Linux だがクロスコンパイルで型検査まで行う。
+      - name: Cross build (windows/darwin)
+        run: |
+          GOOS=windows GOARCH=amd64 go build ./...
+          GOOS=darwin GOARCH=arm64 go build ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Enforce 100% coverage for pkg/
+        run: |
+          set -euo pipefail
+          # 純粋ロジック（pkg/）は全パッケージ 100% を維持する規約。cmd/ は I/O アダプタ層のため対象外。
+          go test ./pkg/... -cover | tee pkg-cover.txt
+          if grep "coverage:" pkg-cover.txt | grep -qv "coverage: 100.0% of statements"; then
+            echo "::error::pkg/ に 100% 未満のパッケージがあります"
+            # どの関数が未カバーかを列挙して原因を特定しやすくする（Test ステップの coverage.out を利用）。
+            echo "--- 未カバー関数（pkg/）---"
+            go tool cover -func=coverage.out | grep '/pkg/' | grep -v '100.0%' || true
+            exit 1
+          fi
+
+  # CD: main へのマージ（push）またはバージョンタグ(v*)の push 時に、テスト成功後に各プラット
+  # フォーム向けの server / client バイナリをビルドし、成果物としてアップロードする。PR / 他ブランチ
+  # push では実行しない。
+  build:
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 } # サーバーの本番想定（Graviton）
+          - { goos: windows, goarch: amd64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "stable"
+          cache: true
+
+      # wireguard-go はユーザースペース（純 Go）実装のため CGO 無効でクロスコンパイルできる。
+      - name: Build server & client
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          out="dist/${GOOS}-${GOARCH}"
+          mkdir -p "$out"
+          go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-server${ext}" ./cmd/server
+          go build -trimpath -ldflags="-s -w" -o "$out/instant-mesh-client${ext}" ./cmd/client
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: instant-mesh-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/
+          if-no-files-found: error
+
+  # CD(release): バージョンタグ(v*)の push 時のみ、ビルド済みバイナリを GitHub Release の資産として
+  # 公開する。資産名は instant-mesh-{server,client}-<goos>-<goarch>[.exe]。infra/ の user-data は
+  # この安定 URL（…/releases/download/<tag>/instant-mesh-server-linux-arm64）から取得する。
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # リリース作成に必要（トップレベルの read を本ジョブだけ昇格）
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      # artifacts/instant-mesh-<goos>-<goarch>/instant-mesh-{server,client}[.exe]
+      #   → release/instant-mesh-{server,client}-<goos>-<goarch>[.exe]（プラットフォームを名前に含める）
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/instant-mesh-*/; do
+            platform="$(basename "$dir" | sed 's/^instant-mesh-//')"
+            for f in "$dir"*; do
+              fn="$(basename "$f")"
+              if [ "${fn##*.}" = "exe" ]; then
+                cp "$f" "release/${fn%.exe}-${platform}.exe"
+              else
+                cp "$f" "release/${fn}-${platform}"
+              fi
+            done
+          done
+          ls -l release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
