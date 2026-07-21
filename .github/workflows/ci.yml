@@ -111,8 +111,11 @@ jobs:
           # rsrc でマニフェストを COFF リソース(rsrc_windows_amd64.syso)へ変換して cmd/client に
           # 置くと、windows/amd64 ビルド時にリンカが自動リンクする（ダブルクリック起動でも
           # 管理者昇格ダイアログが出るようになる）。サーバーには埋め込まない。
+          # rsrc ツール自体はランナー(linux/amd64)上で実行するため、ステップ全体に効いている
+          # GOOS=windows を打ち消してホスト用にビルドする（さもないと rsrc.exe が生成され
+          # Linux 上で exec format error になる）。-arch は生成する .syso の対象アーキ指定なので amd64 のまま。
           if [ "$GOOS" = "windows" ] && [ "$GOARCH" = "amd64" ]; then
-            go run github.com/akavel/rsrc@v0.10.2 \
+            GOOS=linux GOARCH=amd64 go run github.com/akavel/rsrc@v0.10.2 \
               -manifest cmd/client/instant-mesh-client.manifest \
               -arch amd64 -o cmd/client/rsrc_windows_amd64.syso
           fi
