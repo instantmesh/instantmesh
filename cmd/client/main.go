@@ -182,7 +182,14 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	// なければ従来どおり -account の値を Bearer に用いる（開発フロー互換）。
 	bearer := cfg.account
 	if cfg.cognito.enabled() {
-		token, err := newCognitoLogin(cfg.cognito).signIn(ctx)
+		login := newCognitoLogin(cfg.cognito)
+		// GUI 起動（標準入力コンソール無し）ではサインイン後の戻り先は端末ではなくアプリ画面
+		// なので、コールバックのタブに返す案内文をアプリ画面向けへ差し替える。
+		if !cfg.stdinConsole {
+			login.doneMsg = cognitoDoneMsgGUI
+			login.failMsg = cognitoFailMsgGUI
+		}
+		token, err := login.signIn(ctx)
 		if err != nil {
 			return fmt.Errorf("Cognito サインイン: %w", err)
 		}
