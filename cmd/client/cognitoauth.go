@@ -61,6 +61,11 @@ type cognitoLogin struct {
 	randSrc  io.Reader          // 乱数源（既定 crypto/rand.Reader）
 	tokenURL string             // 空なら cfg から導出（テストで httptest サーバーへ差し替え）
 	timeout  time.Duration      // コールバック待ちタイムアウト（0 なら既定）
+
+	// コールバック完了/失敗時にブラウザのタブへ返す案内文。起動形態（CLI＝端末 / GUI＝アプリ画面）
+	// に応じて戻り先の案内を変えるため差し替え可能にする。空なら既定（端末向け）を用いる。
+	doneMsg string // サインイン成功時の案内
+	failMsg string // サインイン失敗時の案内
 }
 
 // newCognitoLogin は実運用の既定（crypto/rand・実ブラウザ起動・10 秒タイムアウトの HTTP
@@ -77,8 +82,19 @@ func newCognitoLogin(c cognitoConfig) *cognitoLogin {
 		openURL: openBrowser,
 		randSrc: rand.Reader,
 		timeout: cognitoCallbackTimeout,
+		doneMsg: cognitoDoneMsgTerminal,
+		failMsg: cognitoFailMsgTerminal,
 	}
 }
+
+// サインイン後にブラウザのタブへ返す案内文。CLI（端末）向けが既定で、GUI 起動時は
+// runHost がアプリ画面向け（cognito*MsgGUI）へ差し替える。
+const (
+	cognitoDoneMsgTerminal = "サインインが完了しました。このタブを閉じて端末（ターミナル）に戻ってください。"
+	cognitoFailMsgTerminal = "サインインに失敗しました。端末（ターミナル）に戻って確認してください。"
+	cognitoDoneMsgGUI      = "サインインが完了しました。このタブを閉じて InstantMesh の画面に戻ってください。"
+	cognitoFailMsgGUI      = "サインインに失敗しました。InstantMesh の画面に戻って確認してください。"
+)
 
 // callbackResult はコールバックハンドラからサインインループへ渡す結果。
 type callbackResult struct {
@@ -174,9 +190,9 @@ func (l *cognitoLogin) callbackHandler(expectPath, expectState string, resCh cha
 		}
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, "サインインに失敗しました。端末（ターミナル）に戻って確認してください。")
+			_, _ = io.WriteString(w, l.failMsg)
 		} else {
-			_, _ = io.WriteString(w, "サインインが完了しました。このタブを閉じて端末（ターミナル）に戻ってください。")
+			_, _ = io.WriteString(w, l.doneMsg)
 		}
 		once.Do(func() { resCh <- callbackResult{code: code, err: err} })
 	})
