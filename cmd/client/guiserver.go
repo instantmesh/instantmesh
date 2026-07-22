@@ -19,12 +19,22 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/originguard"
 	"github.com/instantmesh/instantmesh/pkg/qr"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
+)
+
+// GUI ハートビートの既定値。ブラウザ SPA の /api/state ポーリング（1 秒間隔）を生存信号とみなし、
+// timeout を超えて途絶えたらブラウザが閉じられたとみなして稼働中セッションを閉じる。別タブへの
+// 移動でポーリングが間引かれても誤検知しないよう timeout に十分な余裕を持たせ、リロードは
+// timeout 内に復帰するため切断しない。
+const (
+	guiHeartbeatInterval = 10 * time.Second
+	guiHeartbeatTimeout  = 45 * time.Second
 )
 
 // errSessionActive は既にセッション（ホスト/参加）が稼働中に別セッション開始を要求したことを表す。
@@ -60,6 +70,11 @@ type guiServer struct {
 	cancel  context.CancelFunc   // 稼働中セッションのキャンセル関数
 	gen     uint64               // セッション世代。後始末ゴルーチンが自分の世代のみ触るための識別子
 
+	// lastBeat はブラウザから最後にハートビート（/api/state ポーリング）を受けた時刻（UnixNano）。
+	// 監視ゴルーチン（読み手）と HTTP ハンドラ（書き手）が触れるため atomic で扱う。
+	lastBeat atomic.Int64
+	now      func() time.Time // 現在時刻（テストで固定時刻へ差し替え可能）
+
 	// セッション起動関数（テストでフェイクへ差し替え可能）。既定は runHost/runGuest。
 	startHost  func(ctx context.Context, cfg hostConfig, store *viewStore, onClient func(*signalclient.Client)) error
 	startGuest func(ctx context.Context, cfg guestConfig, store *viewStore, onClient func(*signalclient.Client)) error
@@ -68,14 +83,20 @@ type guiServer struct {
 // newGUIServer は初期状態（Idle）の GUI サーバーを返す。baseCtx はサーバーのライフサイクル
 // （開始セッションの親コンテキスト）。
 func newGUIServer(baseCtx context.Context, opts guiOptions) *guiServer {
-	return &guiServer{
+	s := &guiServer{
 		store:      newViewStore(),
 		opts:       opts,
 		baseCtx:    baseCtx,
+		now:        time.Now,
 		startHost:  runHost,
 		startGuest: runGuest,
 	}
+	s.touchHeartbeat()
+	return s
 }
+
+// touchHeartbeat はブラウザからの生存信号を受けた時刻を記録する（監視ゴルーチンが途絶判定に使う）。
+func (s *guiServer) touchHeartbeat() { s.lastBeat.Store(s.now().UnixNano()) }
 
 // handler は GUI サーバーの HTTP ルーティングを返す。全 /api/* は originguard で保護し、
 // 悪意サイトからのクロスオリジン要求（CSRF）と DNS リバインディングを弾く。索引ページ("/")は
@@ -118,8 +139,10 @@ func (s *guiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(indexHTML))
 }
 
-// handleState は現在の Snapshot を JSON で返す（フロントがポーリング/購読する）。
+// handleState は現在の Snapshot を JSON で返す（フロントがポーリング/購読する）。このポーリングを
+// 生存信号（ハートビート）とみなして時刻を更新し、途絶＝ブラウザが閉じられたと監視ゴルーチンが判定する。
 func (s *guiServer) handleState(w http.ResponseWriter, r *http.Request) {
+	s.touchHeartbeat()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(s.store.snapshot())
 }
@@ -227,6 +250,18 @@ func (s *guiServer) handleRotate(w http.ResponseWriter, r *http.Request) {
 // また Close はキャンセル前に反映し、finishSession の異常終了通知が「退出しました」を上書き
 // しないようにする（cancel 後にしか finishSession は走らないため順序が保証される）。
 func (s *guiServer) handleLeave(w http.ResponseWriter, r *http.Request) {
+	if !s.closeActiveSession("退出しました") {
+		http.Error(w, "セッションが稼働していません", http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// closeActiveSession は稼働中セッションを終了し、表示を reason で Closed へ落とす。稼働していなけ
+// れば false を返す（handleLeave のユーザー操作と、ハートビート途絶によるブラウザ切断の両方が使う）。
+// セッション制御状態は cancel 前に同期クリアし、finishSession の異常終了通知が reason を上書きしない
+// 順序を保証する（詳細は handleLeave 由来の設計コメント参照）。
+func (s *guiServer) closeActiveSession(reason string) bool {
 	s.mu.Lock()
 	cancel := s.cancel
 	active := s.started
@@ -235,12 +270,33 @@ func (s *guiServer) handleLeave(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	if !active || cancel == nil {
-		http.Error(w, "セッションが稼働していません", http.StatusConflict)
-		return
+		return false
 	}
-	s.store.update(func(m *appstate.Model) { m.Close("退出しました") })
+	s.store.update(func(m *appstate.Model) { m.Close(reason) })
 	cancel()
-	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
+// watchHeartbeat はブラウザからの生存信号（/api/state ポーリング）が timeout を超えて途絶えたら
+// 稼働中セッションを閉じる（ブラウザを閉じた＝VPN もクローズ。方針: セッションのみ終了しプロセスは
+// 常駐継続するため、閉じた後も再度ブラウザを開けば新しいホスト/参加を始められる）。単一ゴルーチンで
+// interval ごとに判定し ctx 終了で抜ける。now 注入で決定的にテストする。
+func (s *guiServer) watchHeartbeat(ctx context.Context, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.now().UnixNano()-s.lastBeat.Load() > int64(timeout) {
+				// 稼働中でなければ closeActiveSession は no-op（idle 放置で誤って何かを閉じない）。
+				if s.closeActiveSession("ブラウザが閉じられたため切断しました") {
+					slog.Info("ブラウザのハートビート途絶によりセッションを終了しました")
+				}
+			}
+		}
+	}
 }
 
 // handleReset は終了状態の表示を初期状態（Idle）へ戻す（新しいホスト/参加を始められるように）。
@@ -292,6 +348,8 @@ func (s *guiServer) startSession(run func(ctx context.Context) error) error {
 	s.cancel = cancel
 	s.mu.Unlock()
 
+	// 開始直後にブラウザからのポーリングがまだ届いていなくても即座に途絶と誤判定しないよう更新する。
+	s.touchHeartbeat()
 	s.store.reset()
 
 	go func() {
@@ -375,6 +433,9 @@ func runGUI(ctx context.Context, addr string, opts guiOptions) error {
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
+
+	// ブラウザを閉じた（ハートビート途絶）を検知して稼働中セッションを閉じる監視を起動する。
+	go gs.watchHeartbeat(ctx, guiHeartbeatInterval, guiHeartbeatTimeout)
 
 	url := "http://" + ln.Addr().String()
 	slog.Info("GUI サーバー起動", "url", url)
