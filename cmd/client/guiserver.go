@@ -420,13 +420,25 @@ func (s *guiServer) getClient() *signalclient.Client {
 }
 
 // runGUI は GUI モードのエントリポイント。addr（127.0.0.1 のみ）で HTTP サーバーを起動し、
-// ブラウザからのホスト/参加操作でセッションを駆動する。ctx 終了でグレースフルシャットダウン
+// GUI からのホスト/参加操作でセッションを駆動する。ctx 終了でグレースフルシャットダウン
 // （稼働中セッションも baseCtx 経由でキャンセルされる）。
+//
+// GUI の表示方法は 2 通り:
+//   - アプリ内ウィンドウ対応 OS（appWindowAvailable=true・現状 Windows）: OS 内蔵 WebView で
+//     LocalAPI をアプリのウィンドウとして開き、その間 HTTP は別ゴルーチンで提供する。ウィンドウを
+//     閉じたら ctx をキャンセルしてサーバーを畳みプロセスを終了する。ウィンドウ生成に失敗したら
+//     既定ブラウザへフォールバックする。
+//   - 非対応 OS: 従来どおり既定ブラウザで開き、HTTP をブロッキング提供する。
 func runGUI(ctx context.Context, addr string, opts guiOptions) error {
+	// runGUI 内で ctx を派生し、ウィンドウを閉じたとき（アプリ内ウィンドウ経路）に defer cancel で
+	// 全ゴルーチン（Shutdown 監視・ハートビート監視・稼働中セッション）を停止できるようにする。
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	gs := newGUIServer(ctx, opts)
 	srv := &http.Server{Handler: gs.handler()}
 
-	// リスナーを先に確立してからブラウザを開く（Serve 前に開くと接続に失敗しうるため）。
+	// リスナーを先に確立してからウィンドウ/ブラウザを開く（Serve 前に開くと接続に失敗しうるため）。
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -434,22 +446,47 @@ func runGUI(ctx context.Context, addr string, opts guiOptions) error {
 
 	go func() {
 		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		shutCtx, sc := context.WithTimeout(context.Background(), 5*time.Second)
+		defer sc()
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	// ブラウザを閉じた（ハートビート途絶）を検知して稼働中セッションを閉じる監視を起動する。
+	// ブラウザ/ウィンドウを閉じた（ハートビート途絶）を検知して稼働中セッションを閉じる監視を起動する。
 	go gs.watchHeartbeat(ctx, guiHeartbeatInterval, guiHeartbeatTimeout)
 
 	url := "http://" + ln.Addr().String()
 	gs.baseURL = url // Cognito サインイン成功後に認証タブを戻す先（Serve 前に設定＝要求受付前に確定）
 	slog.Info("GUI サーバー起動", "url", url)
-	// 既定のブラウザで自動的に開く（ベストエフォート・失敗してもサーバーは継続）。
+
+	// アプリ内ウィンドウ対応 OS では WebView をメインスレッドで表示する（openAppWindow がブロック）。
+	// その間 HTTP は別ゴルーチンで提供する。
+	if appWindowAvailable {
+		serveErr := make(chan error, 1)
+		go func() { serveErr <- serveGUI(srv, ln) }()
+
+		if werr := openAppWindow(ctx, url); werr != nil {
+			// ウィンドウ生成に失敗（WebView2 ランタイム未導入等）。既定ブラウザへフォールバックし、
+			// ctx 終了まで HTTP を提供し続ける。
+			slog.Warn("アプリ内ウィンドウを開けませんでした。既定ブラウザにフォールバックします", "err", werr)
+			if berr := openBrowser(url); berr != nil {
+				slog.Warn("ブラウザの自動起動にも失敗しました。上記 URL を手動で開いてください", "url", url, "err", berr)
+			}
+			return <-serveErr
+		}
+		// ウィンドウが閉じられた → 全ゴルーチンを停止（Shutdown 監視が Serve を終わらせる）。
+		cancel()
+		return <-serveErr
+	}
+
+	// 非対応 OS: 従来どおり既定ブラウザで自動的に開く（ベストエフォート・失敗してもサーバーは継続）。
 	if err := openBrowser(url); err != nil {
 		slog.Warn("ブラウザの自動起動に失敗しました。上記 URL を手動で開いてください", "url", url, "err", err)
 	}
+	return serveGUI(srv, ln)
+}
 
+// serveGUI は HTTP サーバーを起動し、正常なシャットダウン（ErrServerClosed）を nil に畳んで返す。
+func serveGUI(srv *http.Server, ln net.Listener) error {
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
