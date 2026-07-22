@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -472,6 +473,58 @@ func TestFinishSessionStaleGeneration(t *testing.T) {
 	}
 	if ph := gs.store.snapshot().Phase; ph == "closed" {
 		t.Error("古い世代の finishSession は store を閉じてはならない")
+	}
+}
+
+// TestGUIServerHeartbeatTimeout は、ブラウザの生存信号（/api/state ポーリング）が timeout を超えて
+// 途絶えたら稼働中セッションが閉じられ（ブラウザを閉じた＝VPN もクローズ）、途絶前や更新後は
+// 維持されることを検証する。時刻は now 注入で決定的に進める。
+func TestGUIServerHeartbeatTimeout(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	// 制御可能な擬似クロック（UnixNano を atomic で進める）。
+	var nowNano atomic.Int64
+	base := time.Unix(1000, 0)
+	nowNano.Store(base.UnixNano())
+	gs.now = func() time.Time { return time.Unix(0, nowNano.Load()) }
+
+	startFakeHost(t, gs)
+	gs.touchHeartbeat() // 直近ハートビートを現在時刻に合わせる
+
+	wctx, wcancel := context.WithCancel(context.Background())
+	defer wcancel()
+	go gs.watchHeartbeat(wctx, 2*time.Millisecond, 30*time.Second)
+
+	// 途絶していない間はセッションを維持する。
+	time.Sleep(20 * time.Millisecond)
+	if gs.getClient() == nil {
+		t.Fatal("途絶前にセッションが閉じられた")
+	}
+
+	// 時刻を timeout 超へ進める → ブラウザが閉じられたとみなしてセッションを閉じる。
+	nowNano.Store(base.Add(time.Minute).UnixNano())
+	waitFor(t, func() bool { return gs.getClient() == nil })
+	snap := gs.store.snapshot()
+	if snap.Phase != "closed" {
+		t.Errorf("phase=%s, want closed", snap.Phase)
+	}
+	if !strings.Contains(snap.Reason, "ブラウザ") {
+		t.Errorf("reason=%q, want ブラウザ切断の理由", snap.Reason)
+	}
+}
+
+// TestGUIServerHeartbeatIdleNoop は、セッション未稼働なら途絶を検知しても何もしない（無害）ことを
+// 検証する（idle 放置でハートビートが来なくても閉じる対象がない）。
+func TestGUIServerHeartbeatIdleNoop(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+	// 稼働中でなければ closeActiveSession は false（no-op）。
+	if gs.closeActiveSession("x") {
+		t.Error("セッション未稼働で closeActiveSession が true を返した")
+	}
+	if ph := gs.store.snapshot().Phase; ph != "idle" {
+		t.Errorf("phase=%s, want idle（変化しないこと）", ph)
 	}
 }
 
