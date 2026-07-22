@@ -61,6 +61,11 @@ type cognitoLogin struct {
 	randSrc  io.Reader          // 乱数源（既定 crypto/rand.Reader）
 	tokenURL string             // 空なら cfg から導出（テストで httptest サーバーへ差し替え）
 	timeout  time.Duration      // コールバック待ちタイムアウト（0 なら既定）
+
+	// successRedirect が非空なら、サインイン成功時のコールバックを文言ページではなくこの URL へ
+	// 302 リダイレクトする（GUI モードで認証タブをそのまま GUI 画面＝ルーム/QR 表示へ戻すため）。
+	// 空（ヘッドレス CLI）ならブラウザに完了文言を表示し、ユーザーは端末へ戻る。
+	successRedirect string
 }
 
 // newCognitoLogin は実運用の既定（crypto/rand・実ブラウザ起動・10 秒タイムアウトの HTTP
@@ -172,10 +177,14 @@ func (l *cognitoLogin) callbackHandler(expectPath, expectState string, resCh cha
 		if err == nil && state != expectState {
 			err = errStateMismatch
 		}
-		if err != nil {
+		switch {
+		case err != nil:
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, "サインインに失敗しました。端末（ターミナル）に戻って確認してください。")
-		} else {
+		case l.successRedirect != "":
+			// GUI モード: 認証タブをそのまま GUI 画面（ルーム作成/QR 表示）へ遷移させる。
+			http.Redirect(w, r, l.successRedirect, http.StatusFound)
+		default:
 			_, _ = io.WriteString(w, "サインインが完了しました。このタブを閉じて端末（ターミナル）に戻ってください。")
 		}
 		once.Do(func() { resCh <- callbackResult{code: code, err: err} })
