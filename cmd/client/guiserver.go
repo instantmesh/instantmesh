@@ -64,6 +64,10 @@ type guiServer struct {
 	// サーバー停止（グレースフルシャットダウン）で連鎖的にキャンセルされる。
 	baseCtx context.Context
 
+	// baseURL は GUI 自身の URL（例 http://127.0.0.1:8088）。runGUI が bind 確定後に設定する。
+	// Cognito サインイン成功後、認証タブをこの URL（ルーム/QR 表示）へ戻すために使う。
+	baseURL string
+
 	mu      sync.Mutex
 	started bool                 // セッション稼働中か
 	client  *signalclient.Client // セッション確立後の操作用（承認/拒否/再発行/退出）
@@ -182,6 +186,7 @@ func (s *guiServer) handleHost(w http.ResponseWriter, r *http.Request) {
 		auto:      false, // GUI では人が待合室で承認するため自動承認しない
 		useTunnel: s.opts.useTunnel, ifname: s.opts.ifname, stunAddr: s.opts.stunAddr,
 		relay: s.opts.relay, stdinConsole: false, cognito: s.opts.cognito,
+		guiURL: s.baseURL, // Cognito サインイン成功後に認証タブを GUI 画面へ戻す
 	}
 	err := s.startSession(func(ctx context.Context) error {
 		return s.startHost(ctx, cfg, s.store, s.setClient)
@@ -438,6 +443,7 @@ func runGUI(ctx context.Context, addr string, opts guiOptions) error {
 	go gs.watchHeartbeat(ctx, guiHeartbeatInterval, guiHeartbeatTimeout)
 
 	url := "http://" + ln.Addr().String()
+	gs.baseURL = url // Cognito サインイン成功後に認証タブを戻す先（Serve 前に設定＝要求受付前に確定）
 	slog.Info("GUI サーバー起動", "url", url)
 	// 既定のブラウザで自動的に開く（ベストエフォート・失敗してもサーバーは継続）。
 	if err := openBrowser(url); err != nil {

@@ -106,6 +106,51 @@ func TestCognitoLoginSuccess(t *testing.T) {
 	}
 }
 
+// TestCognitoCallbackSuccessRedirect は、successRedirect 設定時に成功コールバックが GUI 画面へ
+// 302 リダイレクトし（完了文言を表示しない）、code/state も正しく渡ることを検証する（GUI モード）。
+func TestCognitoCallbackSuccessRedirect(t *testing.T) {
+	l := testLogin("http://localhost:0/callback")
+	l.successRedirect = "http://127.0.0.1:8088/"
+	resCh := make(chan callbackResult, 1)
+	h := l.callbackHandler("/callback", "st", resCh)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/callback?code=AC&state=st", nil))
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status=%d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://127.0.0.1:8088/" {
+		t.Errorf("Location=%q, want GUI URL", loc)
+	}
+	if strings.Contains(rec.Body.String(), "このタブを閉じて") {
+		t.Error("リダイレクト時は完了文言を表示しないこと")
+	}
+	res := <-resCh
+	if res.err != nil || res.code != "AC" {
+		t.Errorf("result = %+v, want code AC / no err", res)
+	}
+}
+
+// TestCognitoCallbackSuccessMessage は、successRedirect 未設定（ヘッドレス CLI）では従来どおり
+// 完了文言を 200 で返すことを検証する。
+func TestCognitoCallbackSuccessMessage(t *testing.T) {
+	l := testLogin("http://localhost:0/callback")
+	resCh := make(chan callbackResult, 1)
+	h := l.callbackHandler("/callback", "st", resCh)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/callback?code=AC&state=st", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "サインインが完了しました") {
+		t.Errorf("body=%q, want 完了文言", rec.Body.String())
+	}
+	<-resCh
+}
+
 func TestCognitoLoginStateMismatch(t *testing.T) {
 	tok := newTokenServer(t, `{"id_token":"x"}`, nil)
 	defer tok.Close()
