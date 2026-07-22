@@ -4,7 +4,7 @@
 
 ネットワークを開く人（**ホスト**）だけがアカウントを持ち、参加する人（**ゲスト**）はアカウント登録不要（**アカウントレス**）。使い終われば時間経過で自動的に消滅（**エフェメラル**）し、通信は端末間で**E2E暗号化**されます。
 
-> **ステータス**: フェーズ1の**実装が進行中**です。`docs/` に要件・アーキテクチャ・規約、`.agents/` に開発ルールを整備し、コア実装として `pkg/` 配下に UI/トランスポート非依存の純粋ロジック **32 パッケージ（ユニットテスト100%）** と、シグナリング＋リレーサーバー `cmd/server`・ヘッドレスクライアント `cmd/client` を実装済みです。制御プレーン（ルーム作成・待合室承認・キック・エフェメラル管理）とデータプレーン（リレー中継・通信量制限）、クライアントの鍵生成・招待リンク（帯域外MITM照合）・STUN・wireguard-go 設定・仮想NICへのIP付与・**P2P直通の成否検知とリレーへの自動フォールバック**までが動作します。**2台の実機（ParrotOS×2・VMware NAT モード）でメッシュ疎通（仮想NIC生成・割当IP経由の `ping`）を確認済み**です。残りは独立した実NAT間での穴あけ確立／直通⇄リレー切替の疎通検証（今回は同一 NAT 配下のため経路判定は未確認）と GUI の実表示です。進捗の詳細は [`TODO.md`](TODO.md) を参照。
+> **ステータス**: フェーズ1の**実装が進行中**です。`docs/` に要件・アーキテクチャ・規約、`CLAUDE.md` に開発ルール、`.claude/skills/` に実装スキルを整備し、コア実装として `pkg/` 配下に UI/トランスポート非依存の純粋ロジック **33 パッケージ（ユニットテスト100%）** と、シグナリング＋リレーサーバー `cmd/server`・クライアント `cmd/client`（既定は GUI モード。ヘッドレス CLI の host/guest も持つ）を実装済みです。制御プレーン（ルーム作成・待合室承認・キック・エフェメラル管理）とデータプレーン（リレー中継・通信量制限）、クライアントの鍵生成・招待リンク（帯域外MITM照合）・STUN・wireguard-go 設定・仮想NICへのIP付与・**P2P直通の成否検知とリレーへの自動フォールバック**・**GUI（LocalAPI＋埋め込み SPA。Windows は WebView2 アプリ内ウィンドウ）**・**Cognito 認証（PKCE）／S3 監査**までが動作します。**2台の実機（ParrotOS×2・VMware NAT モード）でメッシュ疎通（仮想NIC生成・割当IP経由の `ping`）を確認済み**です。残りは独立した実NAT間での穴あけ確立／直通⇄リレー切替の疎通検証（今回は同一 NAT 配下のため経路判定は未確認）です。進捗の詳細は [`TODO.md`](TODO.md) を参照。
 
 ---
 
@@ -167,23 +167,23 @@ graph TD
 ```
 instant-mesh/
 ├── docs/            # 要件・アーキテクチャ・規約・競合分析
-├── .agents/         # 開発ルール(AGENTS.md)と開発スキル定義
-│   └── skills/      # 開発領域別＋横断の実装スキル（正本。.claude/skills に自動ロード用スタブ）
+├── CLAUDE.md         # 開発ルール（設計原則・コーディング規約）
+├── .claude/skills/   # 開発領域別＋横断の実装スキル（Claude Code が自動ロード）
 ├── cmd/
 │   ├── server/      # シグナリング(/ws)＋リレー(/relay)サーバー
-│   └── client/      # ヘッドレス・シグナリング/P2P クライアント
+│   └── client/      # クライアント（既定 GUI モード＋ヘッドレス CLI）・シグナリング/P2P
 └── pkg/             # UI/トランスポート非依存のコアロジック（純粋・SDK化を見据えた分離）
     ├── plan / nickname / token / ipam / ratelimit / clientip  # ドメイン基礎（プラン/表示名/招待トークン・SAS/IP割当/レート制限/信頼プロキシ実IP解決）
     ├── room / manager                              # ルーム集約・複数ルームのゴルーチンセーフ管理
     ├── signaling / session / hub / cognitojwt / auditlog  # 制御プレーン（メッセージスキーマ・純粋ディスパッチャ・接続配線・Cognito JWT 検証・監査ログのバッチ/シリアライズ）
     ├── relay / relayhub / relayframe               # データプレーン（リレー中継・通信量メータ/スロットル・ワイヤフレーム）
     ├── stun / stunmux / wgstat / connmon           # NATトラバーサル（STUN・WGソケット相乗り・直通成否検知・直通⇄リレー状態機械）
-    └── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / portfilter / appstate / originguard  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・ポート制限・GUIビューモデル・LocalAPI防御）
+    └── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / portfilter / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・ポート制限・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
 ```
 
 各パッケージの役割と進捗は [`TODO.md`](TODO.md) を参照。テストカバレッジは CI（GitHub Actions）の `go test ./... -cover` で確認でき、純粋ロジック（`pkg/`）は全パッケージ 100% カバレッジを維持しています。
 
-### 設計原則（`.agents/AGENTS.md` より）
+### 設計原則（`CLAUDE.md` より）
 - **UIとコアロジックの完全分離**: 接続制御・シグナリング・WireGuard制御・NATトラバーサル等のコアは `pkg/` 配下の独立パッケージとし、UI（`cmd/client/`）やサーバー（`cmd/server/`）から呼び出す（将来のSDK化を見据える）。
 - **E2E暗号化の厳守**: サーバーは復号鍵を一切受信・保持しない。扱うのは公開鍵とメタデータのみ。
 - **秘密情報のメモリ内管理**: WireGuard秘密鍵・一時トークンはディスクに保存せず、メモリ上で生成・保持し、終了時にゼロクリア。
@@ -201,7 +201,7 @@ instant-mesh/
 | [プロダクトビジョン](docs/vision.md) | 解決する課題とユースケース戦略 |
 | [競合分析＆マネタイズ計画書](docs/競合分析_マネタイズ計画書.md) | 競合比較（VPN／C2C GPU）とマネタイズ戦略 |
 | [利用規約](docs/利用規約.md) | Terms of Service |
-| [開発ルール](.agents/AGENTS.md) | 設計原則・コーディング規約 |
+| [開発ルール](CLAUDE.md) | 設計原則・コーディング規約 |
 
 ---
 

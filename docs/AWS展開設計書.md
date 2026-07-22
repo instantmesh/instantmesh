@@ -12,10 +12,10 @@
 
 ## 1. 設計原則の再確認（AWS 展開でも不変）
 
-`.agents/AGENTS.md` の原則は本番でも厳守する。特に AWS 展開で効くもの:
+`CLAUDE.md`（設計原則）の原則は本番でも厳守する。特に AWS 展開で効くもの:
 
 1. **E2E 暗号化の厳守**: シグナリング／リレーサーバーは WireGuard 秘密鍵などの復号鍵を一切受信・保持しない。サーバーが侵害されても通信内容は復号できない。リレーは宛先公開鍵で暗号化ペイロード（`pkg/relayframe`）を素通し転送するだけ。
-2. **監査ログは接続メタデータのみ**: 「どのホストが・いつルーム作成／どの IP のゲストが参加」のみを S3 に記録。ペイロードは一切保存しない（`AuditEvent` の型がこれを保証）。
+2. **監査ログは接続メタデータのみ**: 「どのホストが・いつルーム作成／どの IP のゲストが参加」のみを S3 に記録。ペイロードは一切保存しない（`auditlog.Event` の型がこれを保証）。
 3. **越境移転を発生させない**: 全リソースを `ap-northeast-1`（東京）に配置。
 4. **既存コアは書き直さない**: `pkg/` の純粋ロジックには手を入れず、`cmd/server` の I/F 実装を差し替えることで本番化する（次章）。
 
@@ -29,11 +29,11 @@
 
 | 関心事 | I/F 定義 | 現行モック | 本番実装先 |
 | :--- | :--- | :--- | :--- |
-| ホスト認証 | `Authenticator`（`cmd/server/auth.go`、`Authenticate(r) (hub.Auth, error)`） | `DevAuthenticator`（Bearer をアカウント ID とみなすだけ・署名/失効/発行元を検証しない） | **Cognito JWT 検証** |
-| 監査ログ | `AuditLogger`（`cmd/server/audit.go`、`Log(AuditEvent)`） | `SlogAuditLogger`（`log/slog` 出力のみ） | **S3（Object Lock + KMS）** |
+| ホスト認証 | `Authenticator`（`cmd/server/auth.go`、`Authenticate(r) (hub.Auth, error)`） | `DevAuthenticator`（Bearer をアカウント ID とみなすだけ・署名/失効/発行元を検証しない） | **Cognito JWT 検証（実装済み：`cmd/server/cognito.go`＋`pkg/cognitojwt`）** |
+| 監査ログ | `AuditLogger`（`cmd/server/audit.go`、`Log(auditlog.Event)`） | `SlogAuditLogger`（`log/slog` 出力のみ） | **S3（Object Lock + KMS）（実装済み：`cmd/server/s3audit.go`）** |
 | リレー認可 | `RelayAuthorizer`（`cmd/server/relay.go`、`Authorize(roomID, pubKey) (roomKey, spec, err)`） | `managerAuthorizer`（共有 `*manager.Manager` を直参照） | ステージ1では変更不要（§3.5） |
 
-いずれも `buildServer`（`cmd/server/main.go`）で注入している。Cognito／S3 版を実装して注入を差し替えるだけでよく、**`pkg/` および I/F シグネチャは不変**。
+いずれも `buildServer`（`cmd/server/main.go`）で注入している。Cognito／S3 版は**実装済み**で、フラグ（`-cognito-issuer`＋`-cognito-audience`／`-audit-s3-bucket`）指定時にモックから切り替わる。**`pkg/` および I/F シグネチャは不変**。
 
 ### 2.2. プロセスローカルな状態（水平スケールの壁）
 
@@ -114,7 +114,7 @@ graph TD
 
 - **バケットを 1 つ**作成し、**Object Lock（WORM・改ざん防止）＋ SSE-KMS ＋ IAM 最小権限**で保護。ライフサイクルで保持 3 ヶ月（仮・電気通信事業法の該当性判定を踏まえ確定）。
 - **`AuditLogger` の S3 実装**を追加。1 イベント 1 PUT はコスト・レイテンシとも不利なので、**ctx 付きゴルーチンでバッファリングし定期／サイズ閾値でフラッシュ**（例: 日次 or N 件ごとに 1 オブジェクト、NDJSON）。ゴルーチンは `serve` のライフサイクルに束ね、シャットダウン時にフラッシュしてから終了する。
-- **ペイロード非保存**は `AuditEvent` の型で担保済み。実装でこの契約を破らない。
+- **ペイロード非保存**は `auditlog.Event` の型で担保済み。実装でこの契約を破らない。
 - `RelayAuthorizer` は同一プロセスで manager を共有するため、**ステージ1では現行 `managerAuthorizer` のまま**動く（差し替え不要）。
 
 ### 3.6. セッション：インメモリのまま
@@ -162,32 +162,32 @@ graph TD
 
 ## 5. コードに入れる変更（ステージ1）
 
-`pkg/` は不変。`cmd/server` に I/F 実装を足して注入を差し替える。
+`pkg/` は不変。`cmd/server` に I/F 実装を足して注入を差し替える。**1・2 は S1-1／S1-2 として実装済み**（本節は設計意図の記録も兼ねる）。
 
-1. **Cognito 認証実装**（`cmd/server`）
-   - JWKS 取得＋キャッシュ（TTL・鍵ローテーション追従）は I/O アダプタとして `cmd/server` に置く。
-   - **JWT の `iss/aud/exp`・クレーム検証の純粋部分は `pkg/`（例: `pkg/cognitojwt` 等）へ切り出し**、`now` 注入で決定的にテスト・**100% カバレッジ**を満たす（`.agents/skills/pkg_pure_logic`）。署名検証で使う公開鍵は引数注入にしてネットワークをテストから排除する。
-   - `buildServer`（`main.go`）で `DevAuthenticator` → Cognito 実装へ差し替え。
-2. **S3 監査実装**（`cmd/server`）
-   - `AuditLogger` を実装（バッファ＋定期フラッシュ、ctx／チャネルでキャンセルライフサイクルを持たせリーク防止）。`buildServer` で `SlogAuditLogger` → S3 実装へ差し替え。
+1. **Cognito 認証実装**（`cmd/server`）**〈実装済み〉**
+   - JWKS 取得＋キャッシュ（TTL・鍵ローテーション追従）は I/O アダプタとして `cmd/server`（`cmd/server/cognito.go`）に置いた。
+   - **JWT の `iss/aud/exp`・クレーム検証の純粋部分は既存の `pkg/cognitojwt`** へ切り出し済み（`now` 注入で決定的テスト・**100% カバレッジ**。`.claude/skills/pkg-pure-logic`）。署名検証で使う公開鍵は引数注入にしてネットワークをテストから排除。クライアント側 PKCE は `pkg/oauthpkce`。
+   - `buildServer`（`main.go`）で `DevAuthenticator` → `CognitoAuthenticator` へ差し替え済み（フラグ指定時）。
+2. **S3 監査実装**（`cmd/server`）**〈実装済み〉**
+   - `AuditLogger` の S3 実装（バッファ＋定期フラッシュ、ctx／チャネルでキャンセルライフサイクルを持たせリーク防止）を `cmd/server/s3audit.go` に追加済み。`buildServer` で `SlogAuditLogger` → S3 実装へ差し替え（フラグ指定時）。
 3. **フラグ／設定**
    - Cognito（User Pool ID・region・app client）・S3（バケット・KMS キー）・フラッシュ間隔などを環境変数／フラグで注入。秘密情報はディスクに置かず環境・インスタンスロールで供給。
 4. **`-addr` を `127.0.0.1:8080` に**（caddy 終端前提）。
 
-> 実装着手時は `.agents/skills/cmd-transport-wiring`（I/F 注入・配線）と `.agents/skills/pkg-pure-logic`（純粋ロジック分離）を参照する。
+> 実装着手時は `.claude/skills/cmd-transport-wiring`（I/F 注入・配線）と `.claude/skills/pkg-pure-logic`（純粋ロジック分離）を参照する。
 
 ---
 
 ## 6. IaC 構成
 
-- **AWS CDK（Python）を採用**（プロジェクト決定・当初案の Terraform から変更）。実装は `infra/`（`instant_mesh/stage1_stack.py`）。`npx aws-cdk synth` で認証情報なしに構文検証でき、`cdk deploy` で実プロビジョニングする。以下を再現可能にする（**S1-3 実装済み・`cdk synth` 検証済み**）:
+- **AWS CDK（Python）を採用**（プロジェクト決定・当初案の Terraform から変更）。**IaC は本リポジトリではなく別リポジトリで管理する**（`npx aws-cdk synth` で認証情報なしに構文検証でき、`cdk deploy` で実プロビジョニングする）。以下を再現可能にする（設計対象。実装状況は IaC リポジトリ側で管理）:
   - ネットワーク: VPC / パブリックサブネット（2 AZ 分の枠）/ IGW / ルート / S3 Gateway Endpoint / SG（443・80）
   - コンピュート: EC2（`t4g.small` / AL2023 ARM64）/ EIP / インスタンスロール（最小権限）/ user-data（caddy＋バイナリ配置＋systemd unit）
   - 認証: Cognito User Pool / Hosted UI ドメイン / 公開アプリクライアント（PKCE・ループバックコールバック）/ `pro` グループ。IdP 連携（Google・GitHub）は未設定（client 秘密は state に平文で残さず SSM Parameter Store SecureString 参照とする方針）
   - 監査: S3 バケット（Object Lock 有効・バージョニング・SSE-KMS・ライフサイクル）/ KMS キー
   - 監視: CloudWatch 基本アラーム（Status Check 失敗・CPU 高止まり）/ ロググループ（journald 転送用 CloudWatch Agent は S1-3 フォローアップ）
 - **バイナリ配布**: 既存 CD が出す ARM64 Linux バイナリを GitHub Release / S3 から user-data で取得し配置（`serverBinaryUrl` コンテキスト）。デプロイは「新バイナリ配置 → `systemctl restart`」。
-- **state 管理**: CDK/CloudFormation が管理（Terraform の S3＋DynamoDB バックエンドは不要）。初回のみ `cdk bootstrap`。パラメータは `cdk.json` の context ＋ `-c key=value` で注入。詳細手順は `infra/README.md`。
+- **state 管理**: CDK/CloudFormation が管理（Terraform の S3＋DynamoDB バックエンドは不要）。初回のみ `cdk bootstrap`。パラメータは `cdk.json` の context ＋ `-c key=value` で注入。詳細手順は IaC リポジトリの README を参照。
 
 ---
 
@@ -232,7 +232,7 @@ graph LR
 | :--- | :--- | :--- | :--- |
 | S1-1 | Cognito 認証実装（`pkg/cognitojwt` JWT 検証＋`pkg/oauthpkce` クライアント PKCE〈100%テスト〉、`cmd/server` に JWKS アダプタ・`cmd/client` に PKCE サインイン、`cognito:groups` ベースの tier 判定、`buildServer` で注入） | — | ✅ |
 | S1-2 | S3 監査実装（バッファ＋定期フラッシュ、`buildServer` で注入）。実 PUT 導通は S1-3/S1-4 | — | ✅ |
-| S1-3 | IaC（**AWS CDK/Python**・`infra/`）: VPC/SG/EC2/EIP/IAM/Cognito/S3/CloudWatch ＋ user-data（caddy＋systemd）。`cdk synth` 検証済み。`cdk deploy`（実プロビジョニング）と CW Agent 配線は残 | S1-1, S1-2 | 🚧 |
+| S1-3 | IaC（**AWS CDK/Python**・**別リポジトリで管理**）: VPC/SG/EC2/EIP/IAM/Cognito/S3/CloudWatch ＋ user-data（caddy＋systemd）。進捗は IaC リポジトリ側で管理 | S1-1, S1-2 | （別リポ） |
 | S1-4 | 本番導通確認（Cognito ログイン→ルーム作成→ゲスト参加→P2P/リレー） | S1-3 | ⬜ |
 | S2-1 | （将来）自前 STUN（UDP 3478）導入・SG 追加 | S1-4 | ⬜ |
 | S2-2 | （将来）ElastiCache Redis バックエンド（`manager` 契約実装） | S1-4 | ⬜ |
