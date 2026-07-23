@@ -1,11 +1,11 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
-// 非 Windows 向けのアプリ内ウィンドウ・スタブ（PoC は Windows のみ対応）。appWindowAvailable が
-// false のため runGUI は従来どおり既定ブラウザで GUI を開く経路を通り、openAppWindow は呼ばれない。
-// ビルド（およびクロスビルド）を通すためだけに定義を置く。macOS(WKWebView)/Linux(WebKitGTK)
-// 対応を追加する際は、本ファイルを OS 別に分割して実装へ差し替える。
+// Windows(WebView2)・Linux(Chromium --app) 以外の OS 向けアプリ内ウィンドウ・スタブ（現状は
+// macOS 等が該当）。appWindowAvailable が false のため runGUI は従来どおり既定ブラウザで GUI を
+// 開く経路を通り、openAppWindow は呼ばれない。ビルド（およびクロスビルド）を通すためだけに定義を
+// 置く。macOS(WKWebView) 対応を追加する際は appwindow_darwin.go に実装を分離して差し替える。
 
 import (
 	"context"

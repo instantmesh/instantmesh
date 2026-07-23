@@ -432,7 +432,7 @@ func (s *guiServer) getClient() *signalclient.Client {
 // （稼働中セッションも baseCtx 経由でキャンセルされる）。
 //
 // GUI の表示方法は 2 通り:
-//   - アプリ内ウィンドウ対応 OS（appWindowAvailable=true・現状 Windows）: OS 内蔵 WebView で
+//   - アプリ内ウィンドウ対応 OS（appWindowAvailable=true・Windows=WebView2 / Linux=Chromium --app）:
 //     LocalAPI をアプリのウィンドウとして開き、その間 HTTP は別ゴルーチンで提供する。ウィンドウを
 //     閉じたら ctx をキャンセルしてサーバーを畳みプロセスを終了する。ウィンドウ生成に失敗したら
 //     既定ブラウザへフォールバックする。
