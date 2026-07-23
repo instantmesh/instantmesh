@@ -186,7 +186,15 @@ func (s *guiServer) handleHost(w http.ResponseWriter, r *http.Request) {
 		auto:      false, // GUI では人が待合室で承認するため自動承認しない
 		useTunnel: s.opts.useTunnel, ifname: s.opts.ifname, stunAddr: s.opts.stunAddr,
 		relay: s.opts.relay, stdinConsole: false, cognito: s.opts.cognito,
-		guiURL: s.baseURL, // Cognito サインイン成功後に認証タブを GUI 画面へ戻す
+	}
+	// Cognito サインインは既定ブラウザで開く。ログイン完了後の認証タブの扱いを GUI の表示方法で分ける:
+	//   - アプリ内ウィンドウ（WebView）表示: ルーム情報はウィンドウ側に出るため、認証タブを GUI へ
+	//     リダイレクトせず「閉じてよい」旨を表示し二重表示を避ける（可能なら自動クローズ）。
+	//   - 既定ブラウザ表示: 認証タブをそのまま GUI 画面へ戻す（同一タブがルーム UI になる）。
+	if appWindowAvailable {
+		cfg.guiCloseAuthTab = true
+	} else {
+		cfg.guiURL = s.baseURL
 	}
 	err := s.startSession(func(ctx context.Context) error {
 		return s.startHost(ctx, cfg, s.store, s.setClient)

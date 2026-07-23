@@ -152,7 +152,8 @@ type hostConfig struct {
 	relay            bool
 	stdinConsole     bool          // 標準入力でホスト操作（approve/reject/rotate）を受け付ける（ヘッドレスのみ。GUI は POST で操作）
 	cognito          cognitoConfig // 設定時は PKCE サインインで ID トークンを取得し Bearer に用いる（未設定なら account）
-	guiURL           string        // GUI モード時のみ設定。Cognito サインイン成功後に認証タブをこの URL（GUI 画面）へ戻す
+	guiURL           string        // GUI をブラウザ表示するモードのみ設定。Cognito サインイン成功後に認証タブをこの URL（GUI 画面）へ戻す
+	guiCloseAuthTab  bool          // GUI をアプリ内ウィンドウ（WebView）表示するモードで真。サインイン成功後に認証タブを閉じるよう促す（ルーム情報はウィンドウ側に出るため）
 }
 
 // runHost はホストとして接続し、ルーム作成・待合室承認・ピア構成を処理する。
@@ -184,7 +185,8 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	bearer := cfg.account
 	if cfg.cognito.enabled() {
 		login := newCognitoLogin(cfg.cognito)
-		login.successRedirect = cfg.guiURL // GUI モードなら認証タブを GUI 画面へ戻す（空なら完了文言）
+		login.successRedirect = cfg.guiURL          // GUI をブラウザ表示するモードなら認証タブを GUI 画面へ戻す
+		login.successCloseTab = cfg.guiCloseAuthTab // GUI をアプリ内ウィンドウ表示するモードなら認証タブを閉じるよう促す（いずれも空/偽なら完了文言）
 		token, err := login.signIn(ctx)
 		if err != nil {
 			return fmt.Errorf("Cognito サインイン: %w", err)

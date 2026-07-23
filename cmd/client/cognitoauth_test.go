@@ -151,6 +151,55 @@ func TestCognitoCallbackSuccessMessage(t *testing.T) {
 	<-resCh
 }
 
+// TestCognitoCallbackSuccessCloseTab は、successCloseTab 設定時（アプリ内ウィンドウ/WebView モード）に
+// 成功コールバックがリダイレクトせず「タブを閉じて」旨のページを 200 で返し、window.close を試みることを
+// 検証する。code/state も正しく渡ること。
+func TestCognitoCallbackSuccessCloseTab(t *testing.T) {
+	l := testLogin("http://localhost:0/callback")
+	l.successCloseTab = true
+	resCh := make(chan callbackResult, 1)
+	h := l.callbackHandler("/callback", "st", resCh)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/callback?code=AC&state=st", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Errorf("Location=%q, want リダイレクトしないこと", loc)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "サインインが完了しました") || !strings.Contains(body, "window.close()") {
+		t.Errorf("body=%q, want 完了文言＋window.close()", body)
+	}
+	res := <-resCh
+	if res.err != nil || res.code != "AC" {
+		t.Errorf("result = %+v, want code AC / no err", res)
+	}
+}
+
+// TestCognitoCallbackRedirectBeatsCloseTab は、successRedirect と successCloseTab が両方設定されても
+// リダイレクトを優先することを検証する（successRedirect が非空のときの分岐順序）。
+func TestCognitoCallbackRedirectBeatsCloseTab(t *testing.T) {
+	l := testLogin("http://localhost:0/callback")
+	l.successRedirect = "http://127.0.0.1:8088/"
+	l.successCloseTab = true
+	resCh := make(chan callbackResult, 1)
+	h := l.callbackHandler("/callback", "st", resCh)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/callback?code=AC&state=st", nil))
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status=%d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://127.0.0.1:8088/" {
+		t.Errorf("Location=%q, want GUI URL", loc)
+	}
+	<-resCh
+}
+
 func TestCognitoLoginStateMismatch(t *testing.T) {
 	tok := newTokenServer(t, `{"id_token":"x"}`, nil)
 	defer tok.Close()

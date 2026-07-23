@@ -63,9 +63,15 @@ type cognitoLogin struct {
 	timeout  time.Duration      // コールバック待ちタイムアウト（0 なら既定）
 
 	// successRedirect が非空なら、サインイン成功時のコールバックを文言ページではなくこの URL へ
-	// 302 リダイレクトする（GUI モードで認証タブをそのまま GUI 画面＝ルーム/QR 表示へ戻すため）。
-	// 空（ヘッドレス CLI）ならブラウザに完了文言を表示し、ユーザーは端末へ戻る。
+	// 302 リダイレクトする（GUI をブラウザで表示するモードで、認証タブをそのまま GUI 画面＝
+	// ルーム/QR 表示へ戻すため）。空（ヘッドレス CLI・後述の successCloseTab）ならリダイレクトしない。
 	successRedirect string
+
+	// successCloseTab が真なら、サインイン成功時に「このタブは閉じてよい」旨の完了ページを表示し、
+	// 可能なら window.close() で自動的に閉じる（GUI をアプリ内ウィンドウ＝WebView で表示するモード）。
+	// ルーム情報はウィンドウ側に表示されるため、認証用に開いた外部ブラウザのタブは不要になる。
+	// successRedirect が非空のときはそちらを優先する。
+	successCloseTab bool
 }
 
 // newCognitoLogin は実運用の既定（crypto/rand・実ブラウザ起動・10 秒タイムアウトの HTTP
@@ -84,6 +90,16 @@ func newCognitoLogin(c cognitoConfig) *cognitoLogin {
 		timeout: cognitoCallbackTimeout,
 	}
 }
+
+// signInDoneCloseTabHTML はアプリ内ウィンドウ（WebView）モードでのサインイン成功ページ。
+// ルーム情報はアプリのウィンドウに表示されるため、認証用に開いた外部ブラウザのタブは不要。
+// window.close() で自動的に閉じるのを試み（多くのブラウザはユーザーが URL で開いたタブの
+// スクリプトクローズを拒否するため）、閉じられない場合は文言で手動クローズを促す。
+const signInDoneCloseTabHTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8">` +
+	`<title>InstantMesh</title></head>` +
+	`<body style="font-family:sans-serif;padding:2rem">` +
+	`<p>サインインが完了しました。このタブは閉じて、InstantMesh のウィンドウに戻ってください。</p>` +
+	`<script>window.close()</script></body></html>`
 
 // callbackResult はコールバックハンドラからサインインループへ渡す結果。
 type callbackResult struct {
@@ -182,8 +198,14 @@ func (l *cognitoLogin) callbackHandler(expectPath, expectState string, resCh cha
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, "サインインに失敗しました。端末（ターミナル）に戻って確認してください。")
 		case l.successRedirect != "":
-			// GUI モード: 認証タブをそのまま GUI 画面（ルーム作成/QR 表示）へ遷移させる。
+			// GUI（ブラウザ表示）モード: 認証タブをそのまま GUI 画面（ルーム作成/QR 表示）へ遷移させる。
 			http.Redirect(w, r, l.successRedirect, http.StatusFound)
+		case l.successCloseTab:
+			// GUI（アプリ内ウィンドウ表示）モード: ルーム情報はウィンドウ側に出るため、認証用に
+			// 開いたこのタブは不要。閉じるよう促し、可能なら自動で閉じる（window.close はスクリプトで
+			// 開いたタブ以外はブラウザが拒否しうるためベストエフォート・文言でフォールバックする）。
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, signInDoneCloseTabHTML)
 		default:
 			_, _ = io.WriteString(w, "サインインが完了しました。このタブを閉じて端末（ターミナル）に戻ってください。")
 		}
