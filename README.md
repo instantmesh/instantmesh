@@ -127,13 +127,12 @@ graph TD
 | ゲストのアカウント | 完全不要 | 完全不要 |
 | 最大ゲスト数 | **5** / ルーム | **20** / ルーム |
 | 最大制限時間 | **1時間** / 回 | **24時間** / 回 |
-| ポート制限 | あり（Web・主要開発ポートの既定フィルタ） | なし（全ポート開放） |
 | リレー通信量制限 | 1接続100MB到達で64kbpsへ速度制限 | 制限緩和（または従量課金） |
 | 無通信タイムアウト | 30分（純アイドル）で自動解散 | 30分（純アイドル）で自動解散 |
 | 招待URL再発行 | 利用可 | 利用可 |
 | ホストMFA | 任意（推奨） | 任意（推奨） |
 
-無料版のポート制限は許可ポートを `80` / `443` / `3000` / `5000` / `8080` ＋ `ICMP` に限定します。ただしこれはクライアント側の既定フィルタ（改変によりバイパスされうる）であり、「物理的な防止」ではなく**緩和策**です。強制的な悪用抑止はリレー量制限・レート制限・監査ログで担保します。
+ポートによる制限は設けません（全ポート開放）。E2E 暗号化された直通経路はサーバーからポート単位で選別できず、クライアント側フィルタは改変でバイパスされうるため、ポート制限は悪用抑止として実効性がなく撤廃しました。悪用抑止は強制可能なレイヤ（リレー通信量制限・レート制限・監査ログ）で担保します。
 
 ---
 
@@ -178,7 +177,7 @@ instant-mesh/
     ├── signaling / session / hub / cognitojwt / auditlog  # 制御プレーン（メッセージスキーマ・純粋ディスパッチャ・接続配線・Cognito JWT 検証・監査ログのバッチ/シリアライズ）
     ├── relay / relayhub / relayframe               # データプレーン（リレー中継・通信量メータ/スロットル・ワイヤフレーム）
     ├── stun / stunmux / wgstat / connmon           # NATトラバーサル（STUN・WGソケット相乗り・直通成否検知・直通⇄リレー状態機械）
-    └── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / portfilter / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・ポート制限・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
+    └── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
 ```
 
 各パッケージの役割と進捗は [`TODO.md`](TODO.md) を参照。テストカバレッジは CI（GitHub Actions）の `go test ./... -cover` で確認でき、純粋ロジック（`pkg/`）は全パッケージ 100% カバレッジを維持しています。

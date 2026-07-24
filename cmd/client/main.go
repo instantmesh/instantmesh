@@ -47,7 +47,6 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/invite"
 	"github.com/instantmesh/instantmesh/pkg/meshpeer"
-	"github.com/instantmesh/instantmesh/pkg/plan"
 	"github.com/instantmesh/instantmesh/pkg/secret"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
@@ -239,7 +238,6 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			printInviteQR(os.Stdout, link)
 			// 仮想NICにホストIP付与＋メッシュルート設定、続いて直通監視＋リレーフォールバックを起動。
 			configureTunnel(tun, rc.HostIP)
-			applyPlanFilter(tun, rc.Tier) // プランに応じた無料版ポート制限フィルタ
 			monitor = startMonitor(ctx, tun, cfg.relay, cfg.server, rc.RoomID, pub)
 		case signaling.TypeJoinPending:
 			var jp signaling.JoinPending
@@ -399,7 +397,6 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			store.update(func(m *appstate.Model) { _ = m.Approved(ja.AssignedIP, ja.HostIP) })
 			slog.Info("承認されました", "assigned_ip", ja.AssignedIP, "host_ip", ja.HostIP, "host_verified", true)
 			configureTunnel(tun, ja.AssignedIP) // 仮想NICに割当IP付与＋メッシュルート設定
-			applyPlanFilter(tun, ja.Tier)       // プランに応じた無料版ポート制限フィルタ
 			// ルームIDが確定したので直通監視＋リレーフォールバックを起動する。
 			monitor = startMonitor(ctx, tun, cfg.relay, server, ja.RoomID, pub)
 			advertise(c, tun, cfg.stunAddr, pub) // ホストへ自エンドポイントを広告
@@ -453,24 +450,6 @@ func openTunnel(enabled bool, ifname string, priv *secret.Value) (*Tunnel, error
 	}
 	slog.Info("仮想NIC起動", "ifname", t.Name())
 	return t, nil
-}
-
-// applyPlanFilter はシグナリングで確定したプラン種別 tier に基づき、無料版ポート制限の既定
-// フィルタをトンネルへ適用する（tun が nil / tier が空 / 未知プランなら適用しない＝緩和策の
-// 性質上フェイルオープン）。要件 §4.5。
-func applyPlanFilter(tun *Tunnel, tier string) {
-	if tun == nil || tier == "" {
-		return
-	}
-	spec, ok := plan.Lookup(plan.Tier(tier))
-	if !ok {
-		slog.Warn("未知のプラン種別のためポートフィルタを適用しません", "tier", tier)
-		return
-	}
-	tun.SetPlan(spec)
-	if spec.PortRestricted {
-		slog.Info("無料版ポート制限フィルタを適用しました", "tier", tier, "allowed_tcp", plan.AllowedTCPPorts)
-	}
 }
 
 // configureTunnel は割当メッシュIP をトンネルに付与しメッシュルートを設定する（tun が nil なら何もしない）。
