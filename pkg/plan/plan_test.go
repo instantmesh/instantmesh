@@ -36,27 +36,6 @@ func TestDurations(t *testing.T) {
 	}
 }
 
-func TestTCPPortAllowed(t *testing.T) {
-	free := MustLookup(Free)
-	for _, p := range []int{80, 443, 3000, 5000, 8080} {
-		if !free.TCPPortAllowed(p) {
-			t.Errorf("Free: port %d は許可されるべき", p)
-		}
-	}
-	for _, p := range []int{22, 3389, 25} {
-		if free.TCPPortAllowed(p) {
-			t.Errorf("Free: port %d はブロックされるべき", p)
-		}
-	}
-
-	pro := MustLookup(Pro)
-	for _, p := range []int{22, 3389, 80} {
-		if !pro.TCPPortAllowed(p) {
-			t.Errorf("Pro: port %d は全開放で許可されるべき", p)
-		}
-	}
-}
-
 func TestTierForGroups(t *testing.T) {
 	tests := []struct {
 		name     string

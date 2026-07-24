@@ -37,13 +37,6 @@ const (
 	relayThrottleBps   = 64 * 1000 // 64kbps（上限到達後の速度制限）
 )
 
-// AllowedTCPPorts はポート制限プランで許可する TCP ポート（Web 確認・主要開発サーバー）。
-// 要件定義書 §4.5。ICMP(Ping) は別途許可する。
-//
-// 注意: これはクライアント側のデフォルトフィルタ（緩和策）であり、改変により
-// バイパスされうる。完全な防止ではない点はドキュメントと一致させること。
-var AllowedTCPPorts = []int{80, 443, 3000, 5000, 8080}
-
 // Spec は 1 プランの機能制限をまとめた仕様。
 type Spec struct {
 	Tier Tier
@@ -53,9 +46,6 @@ type Spec struct {
 
 	// MaxDuration はルームの最大制限時間。
 	MaxDuration time.Duration
-
-	// PortRestricted が true の場合、AllowedTCPPorts + ICMP のみ許可する既定フィルタを適用する。
-	PortRestricted bool
 
 	// RelayByteLimit はリレー 1 接続あたりの累計通信量の上限（バイト）。
 	// 到達すると速度制限へ移行する。0 は無制限。
@@ -70,7 +60,6 @@ var specs = map[Tier]Spec{
 		Tier:              Free,
 		MaxGuests:         5,
 		MaxDuration:       1 * time.Hour,
-		PortRestricted:    true,
 		RelayByteLimit:    relayFreeByteLimit,
 		RelayThrottledBps: relayThrottleBps,
 	},
@@ -78,7 +67,6 @@ var specs = map[Tier]Spec{
 		Tier:              Pro,
 		MaxGuests:         20,
 		MaxDuration:       24 * time.Hour,
-		PortRestricted:    false,
 		RelayByteLimit:    0, // 制限緩和
 		RelayThrottledBps: 0,
 	},
@@ -108,18 +96,4 @@ func MustLookup(t Tier) Spec {
 		panic("plan: unknown tier " + string(t))
 	}
 	return s
-}
-
-// TCPPortAllowed は当該プランで指定 TCP ポートが許可されるかを返す。
-// ポート無制限プランでは常に true。
-func (s Spec) TCPPortAllowed(port int) bool {
-	if !s.PortRestricted {
-		return true
-	}
-	for _, p := range AllowedTCPPorts {
-		if p == port {
-			return true
-		}
-	}
-	return false
 }

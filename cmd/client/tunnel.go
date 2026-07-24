@@ -30,9 +30,6 @@ type Tunnel struct {
 	dev  *device.Device
 	bind *sharedBind
 	name string
-	// filter は無料版ポート制限の既定フィルタを適用する tun.Device ラッパ。プラン確定時に
-	// SetPlan で仕様を設定する（portfilter.go）。
-	filter *filterDevice
 	// configureLinkFn は解決済みの netcfg.Plan を実インターフェースへ適用する OS 依存関数。
 	// 既定は configureLink（OS別実装）。テストではフェイクへ差し替える。
 	configureLinkFn func(ifName string, plan netcfg.Plan) error
@@ -65,9 +62,7 @@ func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
 	// WireGuard と STUN で同一の UDP ソケットを共有する bind を使う。これにより STUN で観測する
 	// WAN マッピングが WireGuard の送信マッピングと一致し、NAT hole punching が成立する。
 	bind := newSharedBind()
-	// 無料版ポート制限の既定フィルタを適用するため tun.Device をラップする（プラン確定まで素通し）。
-	filter := newFilterDevice(tunDev)
-	dev := device.NewDevice(filter, bind, device.NewLogger(device.LogLevelError, "wg("+name+") "))
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelError, "wg("+name+") "))
 
 	uapi, err := cfg.UAPI()
 	if err != nil {
@@ -82,7 +77,7 @@ func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
 		dev.Close()
 		return nil, fmt.Errorf("wg 起動: %w", err)
 	}
-	return &Tunnel{dev: dev, bind: bind, name: name, filter: filter, configureLinkFn: configureLink, localPrefixesFn: localOnlinkPrefixes}, nil
+	return &Tunnel{dev: dev, bind: bind, name: name, configureLinkFn: configureLink, localPrefixesFn: localOnlinkPrefixes}, nil
 }
 
 // Apply は差分設定（ピアの追加/更新/削除など）を適用する。
