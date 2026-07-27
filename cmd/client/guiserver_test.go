@@ -107,7 +107,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 		{"POST", "/api/host"}, {"POST", "/api/join"}, {"POST", "/api/approve"},
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
 		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
-		{"GET", "/api/services"},
+		{"GET", "/api/services"}, {"POST", "/api/share"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -591,5 +591,39 @@ func TestGUIServerReset(t *testing.T) {
 	}
 	if snap := gs.store.snapshot(); snap.Phase != "idle" {
 		t.Errorf("phase=%s, want idle", snap.Phase)
+	}
+}
+
+// TestGUIServerShare は共有するサービスの選択（要件 §4.6.1）が共有状態へ反映されることを確かめる。
+func TestGUIServerShare(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	if rec := do(t, gs, "POST", "/api/share", `{"ports":[11434,3000]}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d, want 204", rec.Code)
+	}
+	names, svcs := gs.share.advert()
+	// ホスト自身の名前 + 2 サービス。
+	if len(names) != 3 || len(svcs) != 2 {
+		t.Errorf("names = %v, services = %+v", names, svcs)
+	}
+
+	// 範囲外ポートは 400 で拒否し、共有内容を変えない。
+	if rec := do(t, gs, "POST", "/api/share", `{"ports":[70000]}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("範囲外ポート: status=%d, want 400", rec.Code)
+	}
+	if rec := do(t, gs, "POST", "/api/share", "not-json"); rec.Code != http.StatusBadRequest {
+		t.Errorf("不正な body: status=%d, want 400", rec.Code)
+	}
+	if _, svcs := gs.share.advert(); len(svcs) != 2 {
+		t.Errorf("拒否された要求で共有内容が変わった: %+v", svcs)
+	}
+
+	// 空配列で共有を全て止められる。
+	if rec := do(t, gs, "POST", "/api/share", `{"ports":[]}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d, want 204", rec.Code)
+	}
+	if _, svcs := gs.share.advert(); len(svcs) != 0 {
+		t.Errorf("共有を停止できていない: %+v", svcs)
 	}
 }

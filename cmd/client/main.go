@@ -46,6 +46,7 @@ import (
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/invite"
+	"github.com/instantmesh/instantmesh/pkg/meshname"
 	"github.com/instantmesh/instantmesh/pkg/meshpeer"
 	"github.com/instantmesh/instantmesh/pkg/secret"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
@@ -77,7 +78,14 @@ func main() {
 	cognitoDomain := flag.String("cognito-domain", "https://instantmesh-net.auth.ap-northeast-1.amazoncognito.com", "Cognito Hosted UI ベース URL。既定は公開サーバーのユーザープール。ホストは PKCE サインインで ID トークンを取得する。ローカルの DevAuthenticator サーバーに繋ぐ場合は空文字を指定して無効化する（その場合は -account を Bearer に使用）")
 	cognitoClientID := flag.String("cognito-client-id", "1mhe007gbarnh3u2f0dkglm8ep", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）。既定は公開サーバーのアプリクライアント")
 	cognitoScope := flag.String("cognito-scope", "openid", "要求スコープ（カンマ区切り）")
+	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	useDNS := flag.Bool("dns", true, "共有サービスへ名前で到達できるようにする（.mesh のローカル解決＋OS への split DNS 注入。要 -tunnel・管理者権限）")
 	flag.Parse()
+
+	// 前回の異常終了で OS に残った split DNS 設定を起動時に無条件回収する（要件 §4.6.3）。
+	// 設定の注入・解除には管理者権限が要るため、非特権実行では「残骸を作ることも回収することも
+	// できない」。回収漏れは次の特権実行で解消される。
+	cleanupStaleSplitDNS(*ifname)
 
 	cognito := cognitoConfig{
 		domain:      *cognitoDomain,
@@ -96,12 +104,13 @@ func main() {
 			server: *server, account: *account, durationSec: *duration,
 			auto: *auto, useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr,
 			relay: *relay, stdinConsole: true, cognito: cognito,
+			meshName: *meshName, useDNS: *useDNS,
 		}
 		err = runHost(ctx, cfg, newViewStore(), nil)
 	case "guest":
 		cfg := guestConfig{
 			inviteURL: *inviteURL, nick: *nick, useTunnel: *useTunnel,
-			ifname: *ifname, stunAddr: *stunAddr, relay: *relay,
+			ifname: *ifname, stunAddr: *stunAddr, relay: *relay, useDNS: *useDNS,
 		}
 		err = runGuest(ctx, cfg, newViewStore(), nil)
 	case "gui":
@@ -109,7 +118,7 @@ func main() {
 		opts := guiOptions{
 			server: *server, account: *account, duration: *duration,
 			useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr, relay: *relay,
-			cognito: cognito,
+			cognito: cognito, meshName: *meshName, useDNS: *useDNS,
 		}
 		err = runGUI(ctx, *guiAddr, opts)
 	default:
@@ -153,6 +162,11 @@ type hostConfig struct {
 	cognito          cognitoConfig // 設定時は PKCE サインインで ID トークンを取得し Bearer に用いる（未設定なら account）
 	guiURL           string        // GUI をブラウザ表示するモードのみ設定。Cognito サインイン成功後に認証タブをこの URL（GUI 画面）へ戻す
 	guiCloseAuthTab  bool          // GUI をアプリ内ウィンドウ（WebView）表示するモードで真。サインイン成功後に認証タブを閉じるよう促す（ルーム情報はウィンドウ側に出るため）
+	meshName         string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
+	useDNS           bool          // 共有サービスの名前解決（ローカルレスポンダ＋split DNS）を有効にする
+	// share は共有状態（どのローカルサービスを貸すか）。GUI が操作するため呼び出し側が生成して
+	// 渡す。nil ならヘッドレス運用とみなし runHost が meshName から生成する（共有なしで開始）。
+	share *shareController
 }
 
 // runHost はホストとして接続し、ルーム作成・待合室承認・ピア構成を処理する。
@@ -217,6 +231,16 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	// 購読して描画する（設計原則1: UI とコアの分離）。
 	store.update(func(m *appstate.Model) { _ = m.StartHosting() })
 
+	// メッシュ名の解決（要件 §4.6.3）。ゾーンはこのセッション限りで、共有内容の変更と
+	// ピアの離脱で更新される。レスポンダと OS への注入はメッシュIP 確定後に開始する。
+	zone := meshname.NewZone()
+	share := cfg.share
+	if share == nil {
+		share = newShareController(meshHostLabel(cfg.meshName))
+	}
+	var names *nameResolution
+	defer func() { names.stop() }()
+
 	var monitor *connMonitor // ルーム作成後に生成（トークンが要る）
 	for {
 		env, err := c.Next()
@@ -239,6 +263,9 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			// 仮想NICにホストIP付与＋メッシュルート設定、続いて直通監視＋リレーフォールバックを起動。
 			configureTunnel(tun, rc.HostIP)
 			monitor = startMonitor(ctx, tun, cfg.relay, cfg.server, rc.RoomID, pub)
+			// メッシュ名の解決を開始し、共有内容（既定は未共有）をゾーン・表示・広告へ反映する。
+			names = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, rc.HostIP, zone)
+			share.bind(zone, store, c, pub, rc.HostIP)
 		case signaling.TypeJoinPending:
 			var jp signaling.JoinPending
 			_ = env.Unmarshal(&jp)
@@ -263,10 +290,16 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			_ = env.Unmarshal(&gj)
 			store.update(func(m *appstate.Model) { _ = m.GuestJoined(gj.GuestPubKey, gj.AssignedIP) })
 			slog.Info("ゲスト参加", "nickname", gj.Nickname, "assigned_ip", gj.AssignedIP, "guest", gj.GuestPubKey)
-			advertise(c, tun, cfg.stunAddr, pub) // 新ゲストへ自エンドポイントを広告
+			advertise(c, tun, cfg.stunAddr, pub, share) // 新ゲストへ自エンドポイントと共有内容を広告
 		case signaling.TypeGuestLeft:
 			var gl signaling.GuestLeft
 			_ = env.Unmarshal(&gl)
+			// 離脱したゲストの名前をゾーンから外す（表示状態の更新前に IP を引く）。
+			if ip, ok := store.guestIP(gl.GuestPubKey); ok {
+				if addr, err := netip.ParseAddr(ip); err == nil {
+					zone.Remove(addr)
+				}
+			}
 			store.update(func(m *appstate.Model) { _ = m.GuestLeft(gl.GuestPubKey) })
 			slog.Info("ゲスト離脱", "guest", gl.GuestPubKey)
 			// WireGuard ピアを除去し、監視終了＋リレーのループバックソケットを解放する。
@@ -277,6 +310,9 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			_ = env.Unmarshal(&pi)
 			slog.Info("ピア情報受信", "pubkey", pi.PubKey, "endpoint", pi.WANEndpoint)
 			if ip, ok := store.guestIP(pi.PubKey); ok {
+				// ゲストが名前を広告してきた場合はゾーンへ取り込む（表示は貸す側＝ホストの
+				// 共有内容を出すため更新しない）。
+				applyPeerAdvert(zone, store, ip, pi, false)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.HostPeer(pi.PubKey, ip, endpoint)
 				}
@@ -323,6 +359,7 @@ type guestConfig struct {
 	useTunnel        bool
 	ifname, stunAddr string
 	relay            bool
+	useDNS           bool // ホストが広告した名前で共有サービスへ到達できるようにする
 }
 
 // runGuest はゲストとして招待リンクから参加を申請し、承認・ピア構成を処理する。
@@ -378,6 +415,12 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 	// ため、招待トークンではなくサーバーが払い出したルームIDを束ねる（ピア登録は peer_info 受信時）。
 	var monitor *connMonitor
 	var hostIP string // 承認時に確定するホストのメッシュ IP（peer_info でピア構成に使う）
+
+	// ホストが広告する名前を解決するローカルゾーン（要件 §4.6.3）。レスポンダと OS への注入は
+	// 自身のメッシュIP が確定する承認後に開始する。
+	zone := meshname.NewZone()
+	var names *nameResolution
+	defer func() { names.stop() }()
 	for {
 		env, err := c.Next()
 		if err != nil {
@@ -399,7 +442,10 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			configureTunnel(tun, ja.AssignedIP) // 仮想NICに割当IP付与＋メッシュルート設定
 			// ルームIDが確定したので直通監視＋リレーフォールバックを起動する。
 			monitor = startMonitor(ctx, tun, cfg.relay, server, ja.RoomID, pub)
-			advertise(c, tun, cfg.stunAddr, pub) // ホストへ自エンドポイントを広告
+			// 自身のメッシュIP が確定したのでローカル DNS レスポンダと split DNS を起動する
+			// （ホストの名前は続く peer_info で届く）。
+			names = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, ja.AssignedIP, zone)
+			advertise(c, tun, cfg.stunAddr, pub, nil) // ホストへ自エンドポイントを広告（ゲストは名前を配らない）
 		case signaling.TypeJoinRejected:
 			var jr signaling.JoinRejected
 			_ = env.Unmarshal(&jr)
@@ -417,6 +463,9 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			_ = env.Unmarshal(&pi)
 			slog.Info("ピア情報受信", "pubkey", pi.PubKey, "endpoint", pi.WANEndpoint)
 			if pi.PubKey == hostPubKey {
+				// ホストが広告した名前と共有中サービスを取り込む（名前はホストの自己申告であり、
+				// 信頼の根拠は照合済みのホスト公開鍵の方である・§4.6.3）。
+				applyPeerAdvert(zone, store, hostIP, pi, true)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.GuestPeer(hostPubKey, hostIP, endpoint)
 				}
@@ -528,7 +577,11 @@ func trackPeer(monitor *connMonitor, pubKey, directEP string, build func(string)
 // tun が起動していれば WireGuard と同一ソケットから STUN を行い（WAN マッピングが WireGuard の送信
 // マッピングと一致）、未起動なら別ソケットの STUN にフォールバックする（対称NAT下では WireGuard と
 // マッピングがずれ hole punching が成立しない限界がある）。
-func advertise(c *signalclient.Client, tun *Tunnel, stunAddr, pubKey string) {
+//
+// share が非 nil（ホスト）なら共有層の広告（メッシュ名・共有中サービス）を相乗りさせる。名前の配布は
+// この peer_info に載るため、STUN を無効化（-stun=）した場合は名前解決も配布されない（メッシュIP
+// 直接での到達は従来どおり可能）。
+func advertise(c *signalclient.Client, tun *Tunnel, stunAddr, pubKey string, share *shareController) {
 	if stunAddr == "" {
 		return
 	}
@@ -547,7 +600,16 @@ func advertise(c *signalclient.Client, tun *Tunnel, stunAddr, pubKey string) {
 		return
 	}
 	slog.Info("WAN エンドポイント発見", "endpoint", wan.String(), "shared_socket", shared)
-	if err := c.SendPeerInfo(pubKey, wan.String(), nil, nil); err != nil {
+	var (
+		names []string
+		svcs  []signaling.SharedService
+	)
+	if share != nil {
+		// 以後の共有内容の変更は、この記録済みエンドポイントで再送する（STUN をやり直さない）。
+		share.setEndpoint(wan.String())
+		names, svcs = share.advert()
+	}
+	if err := c.SendPeerInfo(pubKey, wan.String(), names, svcs); err != nil {
 		slog.Warn("peer_info 送信に失敗", "err", err)
 	}
 }

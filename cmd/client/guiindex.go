@@ -40,6 +40,8 @@ li.row { display: flex; justify-content: space-between; align-items: center; gap
 .badge { font-size: .75rem; padding: .15rem .5rem; border-radius: 999px; }
 .badge.direct { background: #dcfce7; color: #166534; }
 .badge.relay { background: #fef3c7; color: #92400e; }
+label.pick { display: flex; align-items: center; gap: .5rem; margin: 0; font-size: .95rem; }
+label.pick input { width: auto; margin: 0; }
 #err { background: #fef2f2; color: #991b1b; padding: .75rem 1.5rem; border-bottom: 1px solid #fecaca; }
 @media (prefers-color-scheme: dark) {
   body { background: #18181b; color: #e5e5e7; }
@@ -65,6 +67,10 @@ var lastSnap = null;
 // ホスト画面に入ったとき一度だけ取得し、以後は「再検出」ボタンでのみ更新する（毎秒の走査を避ける）。
 var services = null;
 var servicesLoading = false;
+// 共有するサービスの選択状態（ポート番号 → 真偽）。共有可否はホストの明示選択によるため
+// （要件 §4.6.1）、検出結果とは別に保持し、「共有を更新」を押したときだけサーバーへ送る。
+// null = 未初期化（ホスト画面に入ったときサーバー側の共有中一覧から復元する）。
+var selected = null;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -121,26 +127,52 @@ async function loadServices() {
   if (lastSnap) render(lastSnap);
 }
 
-// servicesSection はホスト側で検出したローカルサービスを一覧提示する（要件 §4.6.1）。
-// 現時点で提示できる到達手段はメッシュIP直接（§4.6.2 経路(2)）のみ。安定名（経路(1)）と
-// loopback プロキシ（経路(3)）は未実装であり、ここでは約束しない。
+// initSelected は共有の選択状態を、サーバー側の共有中一覧から一度だけ復元する。
+function initSelected(s) {
+  if (selected !== null) return;
+  selected = {};
+  (s.shared || []).forEach(function(v) { selected[v.port] = true; });
+}
+
+// servicesSection はホスト側で検出したローカルサービスを一覧提示し、貸すものを選ばせる
+// （要件 §4.6.1: 検出結果はあくまで候補提示であり、共有可否はホストの明示選択による）。
 function servicesSection(s) {
   if (services === null) {
     return '<section class="card"><h2>ローカルサービス</h2><p class="muted">検出中…</p></section>';
   }
+  initSelected(s);
   var body = services.length
     ? '<ul>' + services.map(function(v) {
-        var url = 'http://' + (s.hostIp || '') + ':' + v.port;
-        return '<li class="row"><div><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span>' +
-          '<br><code>' + esc(url) + '</code></div>' +
-          '<div class="actions"><button data-copy="' + esc(url) + '">URLをコピー</button></div></li>';
+        var checked = selected[v.port] ? ' checked' : '';
+        return '<li class="row"><label class="pick"><input type="checkbox" data-port="' + v.port + '"' + checked + '>' +
+          '<span><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span></span></label></li>';
       }).join('') + '</ul>'
     : '<p class="muted">起動中のローカルサービスは見つかりませんでした。</p>';
   return '<section class="card"><h2>ローカルサービス（' + services.length + '）</h2>' +
-    '<p class="muted">承認済みのゲストだけが、このメッシュIP付きURLで到達できます。' +
+    '<p class="muted">貸すサービスを選んで「共有を更新」を押すと、承認済みのゲストだけが到達できるようになります。' +
     '検出はループバックへの TCP 接続確認のみで、サービスへ要求は送っていません。</p>' +
     body +
-    '<div class="actions"><button id="btn-rescan">再検出</button></div></section>';
+    '<div class="actions"><button id="btn-share">共有を更新</button><button id="btn-rescan">再検出</button></div></section>';
+}
+
+// sharedSection は共有中サービスの到達 URL を提示する（ホスト＝自分が貸しているもの／
+// ゲスト＝ホストから広告されたもの）。URL は名前（要件 §4.6.2 経路(1)）とメッシュIP直接
+// （経路(2)）の 2 系統を、いずれもスキーム込みの完全な形でコピーさせる（§4.6.3）。
+function sharedSection(s) {
+  var list = s.shared || [];
+  if (!list.length) return '';
+  var rows = list.map(function(v) {
+    var named = v.url
+      ? '<code>' + esc(v.url) + '</code><button data-copy="' + esc(v.url) + '">コピー</button>'
+      : '<span class="muted">名前解決は無効です（メッシュIPで到達してください）</span>';
+    return '<li class="row"><div><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span>' +
+      '<br>' + named +
+      '<br><code>' + esc(v.meshUrl) + '</code><button data-copy="' + esc(v.meshUrl) + '">コピー</button></div></li>';
+  }).join('');
+  return '<section class="card"><h2>共有中（' + list.length + '）</h2>' +
+    '<p class="muted">到達できるのは承認済みのゲストだけです。名前は自己申告であり本人確認の根拠にはなりません' +
+    '（相手の確認は SAS の読み合わせで行ってください）。</p>' +
+    '<ul>' + rows + '</ul></section>';
 }
 
 function peersSection(s) {
@@ -177,6 +209,7 @@ function hostingHTML(s) {
       '<p class="muted">SAS（ホスト鍵。ゲストへ帯域外で伝え、読み合わせて MITM を防ぐ）</p><code class="sas">' + esc(s.sas) + '</code>' +
     '</section>' +
     servicesSection(s) +
+    sharedSection(s) +
     '<section class="card"><h2>待合室（' + pending.length + '）</h2>' + pendingBody + '</section>' +
     '<section class="card"><h2>参加者（' + approved.length + '）</h2>' + approvedBody + '</section>' +
     peersSection(s);
@@ -190,10 +223,15 @@ function waitingHTML(s) {
 }
 
 function activeHTML(s) {
+  var meshName = s.meshName
+    ? '<p>ホスト名 <code>' + esc(s.meshName) + '</code> <span class="muted">（このホストの全ポートへ名前で到達できます）</span></p>'
+    : '';
   return '<section class="card"><h2>接続中</h2>' +
     '<p>自分のIP <code>' + esc(s.assignedIp || '-') + '</code></p>' +
     '<p>ホストIP <code>' + esc(s.hostIp || '-') + '</code></p>' +
+    meshName +
     '<div class="actions"><button class="danger" id="btn-leave">退出</button></div></section>' +
+    sharedSection(s) +
     peersSection(s);
 }
 
@@ -237,6 +275,16 @@ function wire(s) {
   if (rs) rs.onclick = function() { post('/api/reset'); };
   var rc = document.getElementById('btn-rescan');
   if (rc) rc.onclick = function() { loadServices(); };
+  var sh = document.getElementById('btn-share');
+  if (sh) sh.onclick = function() {
+    var ports = [];
+    for (var p in selected) { if (selected[p]) ports.push(parseInt(p, 10)); }
+    post('/api/share', {ports: ports});
+  };
+  var cbs = document.querySelectorAll('[data-port]');
+  for (var m = 0; m < cbs.length; m++) (function(b) {
+    b.onchange = function() { selected[b.getAttribute('data-port')] = b.checked; };
+  })(cbs[m]);
   var cus = document.querySelectorAll('[data-copy]');
   for (var n = 0; n < cus.length; n++) (function(b) {
     b.onclick = function() {
@@ -255,10 +303,11 @@ function render(s) {
   if (s.error) { errBox.hidden = false; errBox.textContent = 'エラー: ' + s.error; } else { errBox.hidden = true; }
   // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
   if (s.phase === 'hosting' && services === null) loadServices();
-  // ホストを離れたら結果を捨て、次にホストになったとき再走査させる。
+  // ホストを離れたら結果と選択を捨て、次にホストになったとき再走査・再復元させる。
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
+  if (s.phase !== 'hosting') selected = null;
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services);
+  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
