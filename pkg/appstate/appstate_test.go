@@ -25,7 +25,7 @@ func hosting(t *testing.T) *Model {
 	if err := m.StartHosting(); err != nil {
 		t.Fatalf("StartHosting: %v", err)
 	}
-	if err := m.RoomCreated("room1", "instantmesh://join?x=1", "HOSTSAS"); err != nil {
+	if err := m.RoomCreated("room1", "instantmesh://join?x=1", "HOSTSAS", "10.0.0.1"); err != nil {
 		t.Fatalf("RoomCreated: %v", err)
 	}
 	return m
@@ -59,6 +59,10 @@ func TestHostHappyPath(t *testing.T) {
 	}
 	if m.RoomID != "room1" || m.InviteLink == "" || m.SAS != "HOSTSAS" {
 		t.Fatalf("room fields not set: %+v", m)
+	}
+	// ホスト自身のメッシュ IP も保持する（共有サービスの到達 URL 組み立てに使う）。
+	if m.HostIP != "10.0.0.1" || m.View().HostIP != "10.0.0.1" {
+		t.Fatalf("HostIP=%q view=%q, want 10.0.0.1", m.HostIP, m.View().HostIP)
 	}
 	// 再発行で招待リンクが差し替わる。
 	if err := m.ReissueInvite("instantmesh://join?x=2"); err != nil {
@@ -290,10 +294,10 @@ func TestInvalidTransitions(t *testing.T) {
 	}
 
 	// RoomCreated: ロール不正（New）／フェーズ不正（Hosting で再実行）。
-	if err := New().RoomCreated("r", "l", "s"); !errors.Is(err, ErrInvalidState) {
+	if err := New().RoomCreated("r", "l", "s", "10.0.0.1"); !errors.Is(err, ErrInvalidState) {
 		t.Error("RoomCreated without host role should fail")
 	}
-	if m := hosting(t); !errors.Is(m.RoomCreated("r", "l", "s"), ErrInvalidState) {
+	if m := hosting(t); !errors.Is(m.RoomCreated("r", "l", "s", "10.0.0.1"), ErrInvalidState) {
 		t.Error("RoomCreated in Hosting should fail (phase operand)")
 	}
 

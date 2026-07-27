@@ -102,7 +102,7 @@ type Model struct {
 	HostPubKey string // ゲスト: 招待のホスト公開鍵（帯域外 MITM 照合用）
 	Nickname   string // ゲスト: 自称ニックネーム
 	AssignedIP string // ゲスト: 自身に割り当てられたメッシュ IP
-	HostIP     string // ゲスト: ホストのメッシュ IP
+	HostIP     string // ホストのメッシュ IP（ホスト=自身の払出 IP／ゲスト=接続先ホストの IP）
 	Guests     []Guest
 	Peers      []Peer
 	Reason     string // Closed の理由（拒否理由・解散理由）
@@ -126,14 +126,17 @@ func (m *Model) StartHosting() error {
 	return nil
 }
 
-// RoomCreated はサーバーからのルーム作成完了を反映する（招待リンク・SAS を保持）。
-func (m *Model) RoomCreated(roomID, inviteLink, sas string) error {
+// RoomCreated はサーバーからのルーム作成完了を反映する（招待リンク・SAS・自身のメッシュ IP を保持）。
+// hostIP はルームの /24 からホストへ払い出されたアドレスで、共有するローカルサービスへゲストが
+// 到達する URL（要件 §4.6.2 の経路(2) メッシュIP直接）の組み立てに使う。
+func (m *Model) RoomCreated(roomID, inviteLink, sas, hostIP string) error {
 	if m.Role != RoleHost || m.Phase != PhaseConnecting {
 		return ErrInvalidState
 	}
 	m.RoomID = roomID
 	m.InviteLink = inviteLink
 	m.SAS = sas
+	m.HostIP = hostIP
 	m.Phase = PhaseHosting
 	return nil
 }

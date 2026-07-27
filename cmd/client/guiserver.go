@@ -37,6 +37,10 @@ const (
 	guiHeartbeatTimeout  = 45 * time.Second
 )
 
+// serviceScanTimeout は /api/services 1 回あたりの検出全体の上限。個々の connect は probeTimeout で
+// 切れるが、走査ポートが増えても画面が待たされないよう全体にも上限を置く（超過分は未検出扱い）。
+const serviceScanTimeout = 3 * time.Second
+
 // errSessionActive は既にセッション（ホスト/参加）が稼働中に別セッション開始を要求したことを表す。
 var errSessionActive = errors.New("gui: session already active")
 
@@ -82,6 +86,9 @@ type guiServer struct {
 	// セッション起動関数（テストでフェイクへ差し替え可能）。既定は runHost/runGuest。
 	startHost  func(ctx context.Context, cfg hostConfig, store *viewStore, onClient func(*signalclient.Client)) error
 	startGuest func(ctx context.Context, cfg guestConfig, store *viewStore, onClient func(*signalclient.Client)) error
+
+	// probeDial はローカルサービス検出の TCP connect（テストでフェイクへ差し替え可能）。既定は dialTCP。
+	probeDial dialFunc
 }
 
 // newGUIServer は初期状態（Idle）の GUI サーバーを返す。baseCtx はサーバーのライフサイクル
@@ -94,6 +101,7 @@ func newGUIServer(baseCtx context.Context, opts guiOptions) *guiServer {
 		now:        time.Now,
 		startHost:  runHost,
 		startGuest: runGuest,
+		probeDial:  dialTCP,
 	}
 	s.touchHeartbeat()
 	return s
@@ -109,6 +117,7 @@ func (s *guiServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.guard(s.handleState))
 	mux.HandleFunc("GET /api/qr", s.guard(s.handleQR))
+	mux.HandleFunc("GET /api/services", s.guard(s.handleServices))
 	mux.HandleFunc("POST /api/host", s.guard(s.handleHost))
 	mux.HandleFunc("POST /api/join", s.guard(s.handleJoin))
 	mux.HandleFunc("POST /api/approve", s.guard(s.handleApprove))
@@ -169,6 +178,24 @@ func (s *guiServer) handleQR(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
 	_, _ = w.Write([]byte(qrSVG(code)))
+}
+
+// handleServices は共有候補となるローカルサービスを検出して返す（要件 §4.6.1）。
+// 返すのはあくまで候補であり、どれを共有するかはホストの明示選択による。プローブは
+// ループバックへの TCP connect までで、HTTP リクエストは送らない（svcprobe.go 参照）。
+func (s *guiServer) handleServices(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), serviceScanTimeout)
+	defer cancel()
+
+	cands, err := detectLocalServices(ctx, nil, s.probeDial)
+	if err != nil {
+		// 走査対象は既知ポート表のみなので通常は起きない（範囲外ポートが表に混入した場合だけ）。
+		slog.Error("ローカルサービス検出に失敗", "err", err)
+		http.Error(w, "ローカルサービスの検出に失敗しました", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"services": cands})
 }
 
 // handleHost はホストとしてセッションを開始する。body は任意で {"duration": 秒}。
