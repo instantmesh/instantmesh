@@ -2,6 +2,7 @@ package signaling
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +112,59 @@ func TestEncodeMarshalError(t *testing.T) {
 	// チャネルは JSON 化できないため、Encode はマーシャルエラーを伝播すべき。
 	if _, err := Encode(TypeError, make(chan int)); err == nil {
 		t.Error("シリアライズ不能なペイロードはエラーを返すべき")
+	}
+}
+
+// TestPeerInfoSharingAdvertisement は共有層（要件 §4.6）の広告に対する量的上限の検証を確かめる。
+// 構文（ラベル規則・ゾーン所属）はサーバーの関心事ではないため、ここでは検査しない。
+func TestPeerInfoSharingAdvertisement(t *testing.T) {
+	base := func() PeerInfo {
+		return PeerInfo{PubKey: "pk", WANEndpoint: "203.0.113.1:51820"}
+	}
+	longName := strings.Repeat("a", MaxPeerNameLen+1)
+
+	ok := base()
+	ok.Names = []string{"tanaka.mesh", "ollama.tanaka.mesh"}
+	ok.Services = []SharedService{{Name: "ollama.tanaka.mesh", Port: 11434}}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("妥当な広告が弾かれた: %v", err)
+	}
+
+	tooManyNames := base()
+	tooManyNames.Names = make([]string, MaxPeerNames+1)
+	for i := range tooManyNames.Names {
+		tooManyNames.Names[i] = "a.mesh"
+	}
+	tooManyServices := base()
+	tooManyServices.Services = make([]SharedService, MaxSharedServices+1)
+	for i := range tooManyServices.Services {
+		tooManyServices.Services[i] = SharedService{Name: "a.mesh", Port: 80}
+	}
+	longNameMsg := base()
+	longNameMsg.Names = []string{longName}
+	longServiceName := base()
+	longServiceName.Services = []SharedService{{Name: longName, Port: 80}}
+
+	tooLong := []PeerInfo{tooManyNames, tooManyServices, longNameMsg, longServiceName}
+	for _, m := range tooLong {
+		if err := m.Validate(); !errors.Is(err, ErrFieldTooLong) {
+			t.Errorf("上限超過は ErrFieldTooLong を返すべき, got %v", err)
+		}
+	}
+
+	emptyName := base()
+	emptyName.Names = []string{""}
+	emptyServiceName := base()
+	emptyServiceName.Services = []SharedService{{Port: 80}}
+	badPortLow := base()
+	badPortLow.Services = []SharedService{{Name: "a.mesh", Port: 0}}
+	badPortHigh := base()
+	badPortHigh.Services = []SharedService{{Name: "a.mesh", Port: maxPort + 1}}
+
+	missing := []PeerInfo{emptyName, emptyServiceName, badPortLow, badPortHigh}
+	for _, m := range missing {
+		if err := m.Validate(); !errors.Is(err, ErrMissingField) {
+			t.Errorf("不正な広告は ErrMissingField を返すべき, got %v", err)
+		}
 	}
 }

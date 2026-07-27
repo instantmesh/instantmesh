@@ -547,7 +547,7 @@ func advertise(c *signalclient.Client, tun *Tunnel, stunAddr, pubKey string) {
 		return
 	}
 	slog.Info("WAN エンドポイント発見", "endpoint", wan.String(), "shared_socket", shared)
-	if err := c.SendPeerInfo(pubKey, wan.String()); err != nil {
+	if err := c.SendPeerInfo(pubKey, wan.String(), nil, nil); err != nil {
 		slog.Warn("peer_info 送信に失敗", "err", err)
 	}
 }
