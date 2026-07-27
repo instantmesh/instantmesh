@@ -238,8 +238,8 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	if share == nil {
 		share = newShareController(meshHostLabel(cfg.meshName))
 	}
-	var names *nameResolution
-	defer func() { names.stop() }()
+	var nameRes *nameResolution
+	defer func() { nameRes.stop() }()
 
 	var monitor *connMonitor // ルーム作成後に生成（トークンが要る）
 	for {
@@ -264,7 +264,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			configureTunnel(tun, rc.HostIP)
 			monitor = startMonitor(ctx, tun, cfg.relay, cfg.server, rc.RoomID, pub)
 			// メッシュ名の解決を開始し、共有内容（既定は未共有）をゾーン・表示・広告へ反映する。
-			names = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, rc.HostIP, zone)
+			nameRes = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, rc.HostIP, zone)
 			share.bind(zone, store, c, pub, rc.HostIP)
 		case signaling.TypeJoinPending:
 			var jp signaling.JoinPending
@@ -419,8 +419,8 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 	// ホストが広告する名前を解決するローカルゾーン（要件 §4.6.3）。レスポンダと OS への注入は
 	// 自身のメッシュIP が確定する承認後に開始する。
 	zone := meshname.NewZone()
-	var names *nameResolution
-	defer func() { names.stop() }()
+	var nameRes *nameResolution
+	defer func() { nameRes.stop() }()
 	for {
 		env, err := c.Next()
 		if err != nil {
@@ -444,7 +444,7 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			monitor = startMonitor(ctx, tun, cfg.relay, server, ja.RoomID, pub)
 			// 自身のメッシュIP が確定したのでローカル DNS レスポンダと split DNS を起動する
 			// （ホストの名前は続く peer_info で届く）。
-			names = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, ja.AssignedIP, zone)
+			nameRes = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, ja.AssignedIP, zone)
 			advertise(c, tun, cfg.stunAddr, pub, nil) // ホストへ自エンドポイントを広告（ゲストは名前を配らない）
 		case signaling.TypeJoinRejected:
 			var jr signaling.JoinRejected
