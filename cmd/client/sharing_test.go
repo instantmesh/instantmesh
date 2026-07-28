@@ -59,7 +59,7 @@ func TestShareControllerPublishes(t *testing.T) {
 		t.Error("ルーム作成前に配布された")
 	}
 
-	c.bind(zone, store, cl, "hostPK", "10.9.0.1", "free")
+	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: "free"})
 
 	// ゾーン: 自身の名前とサービス名が自分のメッシュIP へ解決する。
 	host := netip.MustParseAddr("10.9.0.1")
@@ -141,7 +141,7 @@ func TestShareControllerRejectsInvalidPort(t *testing.T) {
 func TestShareControllerReset(t *testing.T) {
 	zone, store, _, cl := hostSession(t)
 	c := newShareController("tanaka")
-	c.bind(zone, store, cl, "hostPK", "10.9.0.1", "free")
+	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: "free"})
 	if err := c.setPorts([]int{11434}); err != nil {
 		t.Fatalf("setPorts: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 func TestShareControllerPlanLimit(t *testing.T) {
 	zone, store, _, cl := hostSession(t)
 	c := newShareController("tanaka")
-	c.bind(zone, store, cl, "hostPK", "10.9.0.1", string(plan.Free))
+	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Free)})
 
 	free := plan.MustLookup(plan.Free).MaxSharedServices
 	over := make([]int, free+1)
@@ -245,12 +245,12 @@ func TestShareControllerPlanLimit(t *testing.T) {
 
 	// Pro はより多く貸せる。プラン不明（空文字）は無料プランへフェイルセーフ。
 	pro := newShareController("tanaka")
-	pro.bind(meshname.NewZone(), newViewStore(), cl, "hostPK", "10.9.0.1", string(plan.Pro))
+	pro.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Pro)})
 	if err := pro.setPorts(over); err != nil {
 		t.Errorf("Pro で %d 件が拒否された: %v", len(over), err)
 	}
 	unknown := newShareController("tanaka")
-	unknown.bind(meshname.NewZone(), newViewStore(), cl, "hostPK", "10.9.0.1", "")
+	unknown.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: ""})
 	if err := unknown.setPorts(over); !errors.Is(err, errShareLimit) {
 		t.Errorf("プラン不明は無料プラン扱いにすべき: %v", err)
 	}
@@ -267,12 +267,12 @@ func TestShareControllerTruncatesOnBind(t *testing.T) {
 	}
 
 	// まず Pro のセッションで上限より多く選ぶ。
-	c.bind(meshname.NewZone(), newViewStore(), nil, "hostPK", "10.9.0.1", string(plan.Pro))
+	c.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: nil, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Pro)})
 	if err := c.setPorts(ports); err != nil {
 		t.Fatalf("setPorts: %v", err)
 	}
 	// 次のセッションが無料プランなら、超過分は解除される（残るのは先頭から上限まで）。
-	c.bind(meshname.NewZone(), newViewStore(), nil, "hostPK", "10.9.0.1", string(plan.Free))
+	c.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: nil, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Free)})
 	_, svcs := c.advert()
 	if len(svcs) != free {
 		t.Fatalf("共有数 = %d, want %d", len(svcs), free)

@@ -63,6 +63,7 @@ type shareController struct {
 	pubKey   string
 	zone     *meshname.Zone
 	store    *viewStore
+	fwd      *serviceForwarder
 }
 
 // newShareController は指定ラベルの共有コントローラを返す。セッション開始前に生成してよく、
@@ -72,9 +73,21 @@ func newShareController(label string) *shareController {
 	return &shareController{label: label, maxPorts: plan.MustLookup(plan.Free).MaxSharedServices}
 }
 
+// shareSession はセッション確立時に共有コントローラへ与える依存一式。
+type shareSession struct {
+	zone   *meshname.Zone
+	store  *viewStore
+	client *signalclient.Client
+	fwd    *serviceForwarder // 共有サービスへの転送（nil 可＝-tunnel 無効時）
+	pubKey string
+	hostIP string
+	tier   string // サーバーが確定させたプラン（空ならフェイルセーフに無料プラン）
+}
+
 // bind はセッション確立時（ルーム作成完了）に依存と自身のメッシュIP を与え、現在の共有内容を
 // 反映する。前セッションの残り（IP・接続）は上書きされる。
-func (c *shareController) bind(zone *meshname.Zone, store *viewStore, client *signalclient.Client, pubKey, hostIP, tier string) {
+func (c *shareController) bind(sess shareSession) {
+	zone, store, client, pubKey, hostIP, tier := sess.zone, sess.store, sess.client, sess.pubKey, sess.hostIP, sess.tier
 	addr, err := netip.ParseAddr(hostIP)
 	if err != nil {
 		slog.Warn("ホストのメッシュIP を解釈できず共有の名前配布を見送ります", "host_ip", hostIP, "err", err)
@@ -87,6 +100,7 @@ func (c *shareController) bind(zone *meshname.Zone, store *viewStore, client *si
 	}
 	c.mu.Lock()
 	c.zone, c.store, c.client, c.pubKey, c.addr = zone, store, client, pubKey, addr
+	c.fwd = sess.fwd
 	c.maxPorts = spec.MaxSharedServices
 	// プランが確定した結果、選択済みのポートが上限を超えている場合は先頭から上限までに切り詰める
 	// （Candidates と同じ決定的な順序で残すため、超過分の切り捨ても決定的になる）。
@@ -104,7 +118,7 @@ func (c *shareController) bind(zone *meshname.Zone, store *viewStore, client *si
 func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store = nil, netip.Addr{}, "", nil, "", nil, nil
+	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd = nil, netip.Addr{}, "", nil, "", nil, nil, nil
 	c.maxPorts = plan.MustLookup(plan.Free).MaxSharedServices
 }
 
@@ -158,13 +172,20 @@ func (c *shareController) advert() ([]string, []signaling.SharedService) {
 // 何もしない（bind 時に改めて反映される）。
 func (c *shareController) publish() {
 	c.mu.Lock()
-	addr, zone, store, client, pubKey, endpoint := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint
+	addr, zone, store, client, pubKey, endpoint, fwd := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd
 	c.mu.Unlock()
 	if !addr.IsValid() {
 		return
 	}
 
 	names, svcs := c.advert()
+	// 共有中サービスへの転送を差分適用する。127.0.0.1 バインドのサービスへゲストが到達できる
+	// ようにするための必須部品で（付録C.9 D-10）、共有から外れたポートは直ちに解放される。
+	ports := make([]int, 0, len(svcs))
+	for _, sv := range svcs {
+		ports = append(ports, sv.Port)
+	}
+	fwd.apply(ports)
 	if zone != nil {
 		// 自身の名前も自分のゾーンへ入れる（ホストの画面に出す URL をホスト自身でも検証できる）。
 		if err := zone.Replace(addr, names); err != nil {

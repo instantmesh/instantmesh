@@ -240,6 +240,8 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	}
 	var nameRes *nameResolution
 	defer func() { nameRes.stop() }()
+	var fwd *serviceForwarder
+	defer func() { fwd.closeAll() }()
 
 	var monitor *connMonitor // ルーム作成後に生成（トークンが要る）
 	for {
@@ -265,7 +267,17 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			monitor = startMonitor(ctx, tun, cfg.relay, cfg.server, rc.RoomID, pub)
 			// メッシュ名の解決を開始し、共有内容（既定は未共有）をゾーン・表示・広告へ反映する。
 			nameRes = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, rc.HostIP, zone)
-			share.bind(zone, store, c, pub, rc.HostIP, rc.Tier)
+			// 共有サービスへの転送（メッシュIP:ポート → 127.0.0.1:ポート）。仮想NIC が無ければ
+			// 待ち受けるメッシュIP 自体が存在しないため起動しない。
+			if tun != nil {
+				if addr, perr := netip.ParseAddr(rc.HostIP); perr == nil {
+					fwd = newServiceForwarder(ctx, addr)
+				}
+			}
+			share.bind(shareSession{
+				zone: zone, store: store, client: c, fwd: fwd,
+				pubKey: pub, hostIP: rc.HostIP, tier: rc.Tier,
+			})
 		case signaling.TypeJoinPending:
 			var jp signaling.JoinPending
 			_ = env.Unmarshal(&jp)
