@@ -71,6 +71,9 @@ var servicesLoading = false;
 // （要件 §4.6.1）、検出結果とは別に保持し、「共有を更新」を押したときだけサーバーへ送る。
 // null = 未初期化（ホスト画面に入ったときサーバー側の共有中一覧から復元する）。
 var selected = null;
+// ローカル設定（メッシュ名ラベル・共有の選択・保存の有効/無効。付録C.9 D-14）。null = 未取得。
+// セッションではなく端末の設定なので、画面遷移では捨てずに保持する。
+var conf = null;
 // 利用記録（要件 §4.7・閲覧は有料プラン）。/api/state とは別に緩やかな間隔で取得する。
 var usage = null;
 // アクセス統制（要件 §4.7・有料プラン）。キー要求の状態と発行済みキー。
@@ -115,7 +118,52 @@ function idleHTML() {
       '<label>招待リンク<textarea id="inv" rows="3" placeholder="instantmesh://join?..."></textarea></label>' +
       '<label>ニックネーム<input id="nick" type="text" placeholder="alice"></label>' +
       '<button id="btn-join">参加する</button>' +
-    '</section>';
+    '</section>' +
+    nameSection();
+}
+
+async function loadConfig() {
+  try {
+    conf = await (await fetch('/api/config')).json();
+    if (lastSnap) render(lastSnap);
+  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+}
+
+// saveMeshName はメッシュ名ラベルを保存する（付録C.9 D-14）。応答は適用後の設定なので、
+// サーバーが正規化した名前（例 "Tanaka Note" → "tanaka-note"）がそのまま画面へ反映される。
+async function saveMeshName(label) {
+  try {
+    var res = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({meshLabel: label})
+    });
+    if (res.ok) {
+      conf = await res.json();
+    } else {
+      errBox.hidden = false;
+      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + (await res.text());
+    }
+  } catch (e) {
+    errBox.hidden = false;
+    errBox.textContent = '通信エラー: ' + e;
+  }
+  if (lastSnap) render(lastSnap);
+}
+
+// nameSection はメッシュ名（ゲストが共有サービスへ到達するときのホスト名）を編集させる。
+// 名前はセッションをまたいで安定していることに価値があるため（要件 §4.6.2）、保存が有効なら
+// 次回起動でも同じ名前になる。保存するのは名前と共有の選択だけで、鍵やトークンは保存しない。
+function nameSection() {
+  if (!conf) return '';
+  var note = conf.persisted
+    ? 'この名前と共有の選択はこの端末に保存され、次回の起動でも同じ名前になります。秘密鍵・招待リンク・アクセスキーは保存しません。'
+    : '設定の保存は無効です（-config）。次回の起動では既定の名前に戻ります。';
+  return '<section class="card"><h2>メッシュ名</h2>' +
+    '<p class="muted">ゲストはこの名前で共有サービスへ到達します（例 <code>http://ollama.' +
+    esc(conf.meshLabel) + '.mesh:11434</code>）。' + esc(note) + '</p>' +
+    '<label>名前（英小文字・数字・ハイフン）<input id="mesh-label" value="' + esc(conf.meshLabel) + '"></label>' +
+    '<p class="muted">現在のホスト名 <code>' + esc(conf.meshName) + '</code>。' +
+    '変更すると、これまでゲストへ渡した名前は解決しなくなります（メッシュIP 直接の到達は変わりません）。</p>' +
+    '<div class="actions"><button id="btn-name">名前を保存</button></div></section>';
 }
 
 async function loadControl() {
@@ -298,6 +346,7 @@ function hostingHTML(s) {
       '<div class="qr"><img alt="招待QR" src="/api/qr?l=' + encodeURIComponent(s.inviteLink) + '"></div>' +
       '<p class="muted">SAS（ホスト鍵。ゲストへ帯域外で伝え、読み合わせて MITM を防ぐ）</p><code class="sas">' + esc(s.sas) + '</code>' +
     '</section>' +
+    nameSection() +
     servicesSection(s) +
     sharedSection(s) +
     usageSection(s) +
@@ -373,6 +422,8 @@ function wire(s) {
     for (var p in selected) { if (selected[p]) ports.push(parseInt(p, 10)); }
     post('/api/share', {ports: ports});
   };
+  var nm = document.getElementById('btn-name');
+  if (nm) nm.onclick = function() { saveMeshName(document.getElementById('mesh-label').value.trim()); };
   var rk = document.getElementById('btn-require-key');
   if (rk) rk.onclick = function() { postControl({requireKey: !(control && control.requireKey)}); };
   var iks = document.querySelectorAll('[data-issue-key]');
@@ -406,11 +457,14 @@ function render(s) {
   // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
   if (s.phase === 'hosting' && services === null) loadServices();
   if (s.phase === 'hosting' && control === null) loadControl();
+  // 端末の設定（メッシュ名）は最初の一度だけ取得する。ルーム作成前に名前を決められるよう
+  // idle 画面でも出す（付録C.9 D-14）。
+  if (conf === null && (s.phase === 'idle' || s.phase === 'hosting')) loadConfig();
   // ホストを離れたら結果と選択を捨て、次にホストになったとき再走査・再復元させる。
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
   if (s.phase !== 'hosting') { selected = null; usage = null; control = null; }
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control);
+  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control) + '|' + JSON.stringify(conf);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);

@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/invite"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
 	"github.com/instantmesh/instantmesh/pkg/meshpeer"
@@ -78,7 +79,8 @@ func main() {
 	cognitoDomain := flag.String("cognito-domain", "https://instantmesh-net.auth.ap-northeast-1.amazoncognito.com", "Cognito Hosted UI ベース URL。既定は公開サーバーのユーザープール。ホストは PKCE サインインで ID トークンを取得する。ローカルの DevAuthenticator サーバーに繋ぐ場合は空文字を指定して無効化する（その場合は -account を Bearer に使用）")
 	cognitoClientID := flag.String("cognito-client-id", "1mhe007gbarnh3u2f0dkglm8ep", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）。既定は公開サーバーのアプリクライアント")
 	cognitoScope := flag.String("cognito-scope", "openid", "要求スコープ（カンマ区切り）")
-	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: 保存済み設定 → OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	configPath := flag.String("config", defaultConfigPath(), "ローカル設定（メッシュ名・共有するサービスの選択）の保存先。空文字を指定すると読み込みも保存もしない。秘密鍵・招待トークン・アクセスキーは保存しない")
 	shareGuard := flag.Bool("share-guard", true, "共有していないサービスへのメッシュ越しの到達を遮断する（要 -tunnel）。ICMP と名前解決は常に通す。切り分け用に無効化できる")
 	useDNS := flag.Bool("dns", true, "共有サービスへ名前で到達できるようにする（.mesh のローカル解決＋OS への split DNS 注入。要 -tunnel・管理者権限）")
 	flag.Parse()
@@ -95,6 +97,20 @@ func main() {
 		scopes:      splitScopes(*cognitoScope),
 	}
 
+	// ローカル設定（メッシュ名ラベル・共有の選択）を読む（付録C.9 D-14）。読めなくても既定値で
+	// 続行する。ただし自身より新しい形式だった場合は保存を止め、新しいクライアントの設定を
+	// 上書きで壊さないようにする。
+	conf, cerr := loadClientConfig(*configPath)
+	savePath := *configPath
+	if cerr != nil {
+		slog.Warn("クライアント設定を読み込めませんでした（既定値で続行します）", "path", *configPath, "err", cerr)
+		if errors.Is(cerr, clientconf.ErrUnsupportedVersion) {
+			savePath = ""
+		}
+	}
+	// メッシュ名ラベルの優先順位: -mesh-name > 保存済み設定 > OS のホスト名 > "host"。
+	meshLabel := meshHostLabel(*meshName, conf.MeshLabel)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -105,7 +121,7 @@ func main() {
 			server: *server, account: *account, durationSec: *duration,
 			auto: *auto, useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr,
 			relay: *relay, stdinConsole: true, cognito: cognito,
-			meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
+			meshName: meshLabel, useDNS: *useDNS, shareGuard: *shareGuard,
 		}
 		err = runHost(ctx, cfg, newViewStore(), nil)
 	case "guest":
@@ -120,7 +136,9 @@ func main() {
 		opts := guiOptions{
 			server: *server, account: *account, duration: *duration,
 			useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr, relay: *relay,
-			cognito: cognito, meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
+			cognito: cognito, meshName: meshLabel, useDNS: *useDNS, shareGuard: *shareGuard,
+			// 保存済みの共有の選択を復元し、以後の変更は同じ場所へ書き戻す（付録C.9 D-14）。
+			sharedPorts: conf.SharedPorts, saveConf: configSaver(savePath),
 		}
 		err = runGUI(ctx, *guiAddr, opts)
 	default:
@@ -239,7 +257,9 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	zone := meshname.NewZone()
 	share := cfg.share
 	if share == nil {
-		share = newShareController(meshHostLabel(cfg.meshName))
+		// ヘッドレス運用（-mode host）。共有を選ぶ導線が無いため共有なしで開始し、選択の保存も
+		// しない（メッシュ名ラベルは保存済み設定を含めて main が解決済み・付録C.9 D-14）。
+		share = newShareController(meshHostLabel(cfg.meshName), nil, nil)
 	}
 	var nameRes *nameResolution
 	defer func() { nameRes.stop() }()

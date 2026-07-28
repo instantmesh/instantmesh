@@ -46,7 +46,7 @@ go run ./cmd/client -mode host  -server ws://localhost:8080/ws -cognito-domain= 
 go run ./cmd/client -mode guest -invite "instantmesh://join?..." -nick alice  # -tunnel/-stun 既定有効
 ```
 
-`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（既定は OS のホスト名から導出）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
+`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（優先順位は `-mesh-name` > 保存済み設定 > OS のホスト名）。`-config` はローカル設定（メッシュ名ラベル・共有するサービスの選択）の保存先（既定は OS のユーザ設定ディレクトリの `InstantMesh/config.json`・空文字で読み込みも保存も無効。**秘密鍵・招待トークン・アクセスキーは保存しない**・付録C.9 D-14）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
 
 ## アーキテクチャ
 
@@ -96,7 +96,7 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 
 方向転換で追加された層。メッシュ到達性の上に「特定のローカルサービスを、相手の手元から扱える形で出す」導線を載せる。ゲストの到達経路は3つで、**(1) を主とする**。
 
-1. **名前解決（主・実装済み）** `http://ollama.tanaka.mesh:11434` … **権威はホスト、解決はローカル**。ホストが定義した名前⇄メッシュIPの写像を既存シグナリング（`pkg/signaling` の `PeerInfo.Names`/`Services`）で配布し、各クライアントが自プロセス内に持つレスポンダ（`cmd/client/meshdns.go`・自メッシュIP の `:53`）で即答する。名前空間と写像は `pkg/meshname`（`Zone`）、DNS メッセージの解析/応答組み立ては `pkg/dnsmsg`（`pkg/stun` と同じくソケットは持たない）。OS へは split DNS で当該サフィックスのみ注入（`cmd/client/dnsconfig_<os>.go`: Windows=NRPT／macOS=`/etc/resolver/`／Linux=systemd-resolved）。**`hosts` 書き換えとホスト側DNSサーバー方式は採用しない**（要件 付録C.4）。どのサービスを貸すかは `cmd/client/sharing.go` の `shareController`（GUI の `POST /api/share`）が持つ。
+1. **名前解決（主・実装済み）** `http://ollama.tanaka.mesh:11434` … **権威はホスト、解決はローカル**。ホストが定義した名前⇄メッシュIPの写像を既存シグナリング（`pkg/signaling` の `PeerInfo.Names`/`Services`）で配布し、各クライアントが自プロセス内に持つレスポンダ（`cmd/client/meshdns.go`・自メッシュIP の `:53`）で即答する。名前空間と写像は `pkg/meshname`（`Zone`）、DNS メッセージの解析/応答組み立ては `pkg/dnsmsg`（`pkg/stun` と同じくソケットは持たない）。OS へは split DNS で当該サフィックスのみ注入（`cmd/client/dnsconfig_<os>.go`: Windows=NRPT／macOS=`/etc/resolver/`／Linux=systemd-resolved）。**`hosts` 書き換えとホスト側DNSサーバー方式は採用しない**（要件 付録C.4）。どのサービスを貸すかは `cmd/client/sharing.go` の `shareController`（GUI の `POST /api/share`）が持つ。メッシュ名ラベルと共有の選択は**セッションをまたいで安定させる**ためローカル設定へ保存する（表現・正規化は `pkg/clientconf`、保存場所とファイル I/O は `cmd/client/clientconfig.go`・付録C.9 D-14）。
 2. **メッシュIP直接** `http://10.0.0.1:11434` … 既存の到達性。削らない。
 
 > **前提（付録C.9 D-10・実装済み）**: `127.0.0.1` バインドのサービスにはメッシュIP 宛のパケットが届かないため、上記 (1)(2) はホスト側のユーザ空間転送（メッシュIP:ポート → `localhost`:ポート・`cmd/client/svcforward.go`）が無いと成立しない。OS の DNAT は使わない。共有の選択は D-11（`cmd/client/tunfilter.go` が `tun.Device` を包み、共有していない宛先への**新規接続**を落とす）により到達制御として効く。ICMP と自メッシュIP の `:53` は常に通す。同じ地点でゲスト別・共有別の通信量を計上する（`pkg/usage`・閲覧は Pro 限定）。切り分け用の無効化は `-share-guard=false`。
@@ -106,7 +106,7 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 
 ### GUI（クライアントの LocalAPI 層）
 
-クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET /api/usage` は利用記録、`GET/POST /api/control` はアクセスキーと上限＝いずれも Pro 限定）。
+クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET/POST /api/config` はローカル設定＝メッシュ名の編集と保存状態、`GET /api/usage` は利用記録、`GET/POST /api/control` はアクセスキーと上限＝後の 2 つは Pro 限定）。
 
 - **UI とコアの分離**: GUI とヘッドレス CLI（`-mode host`/`guest`）は同一の受信ループ（`runHost`/`runGuest`）を駆動する。表示状態は `pkg/appstate`（ゴルーチンセーフなビューモデル）に集約し、GUI・CLI とも購読する（設計原則1）。
 - **セキュリティ**: `/api/*` は `pkg/originguard` で同一オリジン以外（CSRF・DNS リバインディング）を fail-closed で 403。127.0.0.1 のみに bind し、WireGuard 秘密鍵などの復号鍵は API に一切載せない（配信は公開鍵・招待・表示メタデータのみ）。

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/originguard"
 	"github.com/instantmesh/instantmesh/pkg/qr"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
@@ -59,6 +60,10 @@ type guiOptions struct {
 	meshName   string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
 	useDNS     bool          // 共有サービスの名前解決を有効にする
 	shareGuard bool          // 共有していない宛先への到達を遮断する
+	// sharedPorts は保存済み設定から復元した共有の選択（付録C.9 D-14。無ければ nil）。
+	sharedPorts []int
+	// saveConf はメッシュ名・共有の選択をローカル設定へ書き出す関数（nil なら保存しない）。
+	saveConf func(clientconf.Config)
 }
 
 // guiServer は GUI 用の状態保持＋HTTP 配信＋セッション制御を担う。store は受信ループ（唯一の
@@ -110,7 +115,7 @@ func newGUIServer(baseCtx context.Context, opts guiOptions) *guiServer {
 		startHost:  runHost,
 		startGuest: runGuest,
 		probeDial:  dialTCP,
-		share:      newShareController(meshHostLabel(opts.meshName)),
+		share:      newShareController(meshHostLabel(opts.meshName), opts.sharedPorts, opts.saveConf),
 	}
 	s.touchHeartbeat()
 	return s
@@ -131,6 +136,8 @@ func (s *guiServer) handler() http.Handler {
 	mux.HandleFunc("POST /api/share", s.guard(s.handleShare))
 	mux.HandleFunc("GET /api/control", s.guard(s.handleControl))
 	mux.HandleFunc("POST /api/control", s.guard(s.handleControlUpdate))
+	mux.HandleFunc("GET /api/config", s.guard(s.handleConfig))
+	mux.HandleFunc("POST /api/config", s.guard(s.handleConfigUpdate))
 	mux.HandleFunc("POST /api/host", s.guard(s.handleHost))
 	mux.HandleFunc("POST /api/join", s.guard(s.handleJoin))
 	mux.HandleFunc("POST /api/approve", s.guard(s.handleApprove))
@@ -245,6 +252,34 @@ func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleConfig はローカル設定（メッシュ名ラベル・共有の選択・保存の有効/無効）を返す
+// （付録C.9 D-14）。返すのは表示設定のみで、秘密鍵・トークンは載せない（設計原則2・3）。
+func (s *guiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(s.share.settings())
+}
+
+// handleConfigUpdate はメッシュ名ラベルを変更する。body は {"meshLabel": "tanaka"}。
+// 適用後の設定を返し、画面が即座に新しいホスト名を出せるようにする。
+//
+// 共有するポートの選択は POST /api/share が入口で（そちらも保存する）、ここでは扱わない。
+func (s *guiServer) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MeshLabel string `json:"meshLabel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "メッシュ名（meshLabel）が必要です", http.StatusBadRequest)
+		return
+	}
+	if err := s.share.setLabel(req.MeshLabel); err != nil {
+		slog.Warn("メッシュ名を変更できません", "err", err)
+		http.Error(w, "メッシュ名には英小文字・数字・ハイフンを使ってください", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(s.share.settings())
 }
 
 // handleControl は統制（アクセスキー・上限）の現在値を返す（要件 §4.7）。
