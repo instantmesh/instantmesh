@@ -265,7 +265,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			monitor = startMonitor(ctx, tun, cfg.relay, cfg.server, rc.RoomID, pub)
 			// メッシュ名の解決を開始し、共有内容（既定は未共有）をゾーン・表示・広告へ反映する。
 			nameRes = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, rc.HostIP, zone)
-			share.bind(zone, store, c, pub, rc.HostIP)
+			share.bind(zone, store, c, pub, rc.HostIP, rc.Tier)
 		case signaling.TypeJoinPending:
 			var jp signaling.JoinPending
 			_ = env.Unmarshal(&jp)

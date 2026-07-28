@@ -12,6 +12,8 @@ package main
 // あるため（信頼の根拠は SAS・§4.6.3）、Zone へ入れる前に pkg/meshname で必ず検証する。
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -20,12 +22,17 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
+	"github.com/instantmesh/instantmesh/pkg/plan"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
 )
 
 // defaultMeshLabel は OS のホスト名からラベルを導出できなかった場合の代替。
 const defaultMeshLabel = "host"
+
+// errShareLimit はプランの同時共有サービス数（pkg/plan の MaxSharedServices・要件 §5）を超えた
+// 選択を表す。UI はこれを利用者向けの案内に写す。
+var errShareLimit = errors.New("sharing: plan limit for concurrent shared services")
 
 // meshHostLabel はメッシュ名に使うラベルを決める（-mesh-name 指定 > OS のホスト名 > "host"）。
 // 名前はセッションをまたいで安定していることに価値がある（ゲストの .env や手順書に書ける・
@@ -49,6 +56,7 @@ type shareController struct {
 
 	mu       sync.Mutex
 	ports    []int
+	maxPorts int                  // 同時共有サービス数の上限（プラン由来・ルーム作成時に確定）
 	addr     netip.Addr           // 自身のメッシュIP（ルーム作成後に確定）
 	endpoint string               // STUN で発見した WAN エンドポイント（peer_info 再送に使う）
 	client   *signalclient.Client // 再広告の送出先（セッション確立後に確定）
@@ -58,21 +66,35 @@ type shareController struct {
 }
 
 // newShareController は指定ラベルの共有コントローラを返す。セッション開始前に生成してよく、
-// セッション固有の依存（ゾーン・表示状態・接続）は bind で与える。
+// セッション固有の依存（ゾーン・表示状態・接続・プラン）は bind で与える。
+// ルーム作成前は上限を無料プランの値に置く（プランはルーム作成時にサーバーが確定させるため）。
 func newShareController(label string) *shareController {
-	return &shareController{label: label}
+	return &shareController{label: label, maxPorts: plan.MustLookup(plan.Free).MaxSharedServices}
 }
 
 // bind はセッション確立時（ルーム作成完了）に依存と自身のメッシュIP を与え、現在の共有内容を
 // 反映する。前セッションの残り（IP・接続）は上書きされる。
-func (c *shareController) bind(zone *meshname.Zone, store *viewStore, client *signalclient.Client, pubKey, hostIP string) {
+func (c *shareController) bind(zone *meshname.Zone, store *viewStore, client *signalclient.Client, pubKey, hostIP, tier string) {
 	addr, err := netip.ParseAddr(hostIP)
 	if err != nil {
 		slog.Warn("ホストのメッシュIP を解釈できず共有の名前配布を見送ります", "host_ip", hostIP, "err", err)
 		return
 	}
+	// プラン未指定（Tier 省略）はフェイルセーフに無料プランとして扱う。
+	spec, ok := plan.Lookup(plan.Tier(tier))
+	if !ok {
+		spec = plan.MustLookup(plan.Free)
+	}
 	c.mu.Lock()
 	c.zone, c.store, c.client, c.pubKey, c.addr = zone, store, client, pubKey, addr
+	c.maxPorts = spec.MaxSharedServices
+	// プランが確定した結果、選択済みのポートが上限を超えている場合は先頭から上限までに切り詰める
+	// （Candidates と同じ決定的な順序で残すため、超過分の切り捨ても決定的になる）。
+	if len(c.ports) > c.maxPorts {
+		slog.Warn("プランの同時共有サービス数を超えるため一部の選択を解除しました",
+			"tier", spec.Tier, "max", c.maxPorts, "selected", len(c.ports))
+		c.ports = c.ports[:c.maxPorts]
+	}
 	c.mu.Unlock()
 	c.publish()
 }
@@ -83,6 +105,7 @@ func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store = nil, netip.Addr{}, "", nil, "", nil, nil
+	c.maxPorts = plan.MustLookup(plan.Free).MaxSharedServices
 }
 
 // setPorts は共有するポート集合を設定し、名前配布と表示へ反映する。共有の実行はホストの明示的な
@@ -93,6 +116,11 @@ func (c *shareController) setPorts(ports []int) error {
 		return err
 	}
 	c.mu.Lock()
+	if len(ports) > c.maxPorts {
+		limit := c.maxPorts
+		c.mu.Unlock()
+		return fmt.Errorf("同時に共有できるサービスは %d 件までです（選択 %d 件）: %w", limit, len(ports), errShareLimit)
+	}
 	c.ports = append([]int(nil), ports...)
 	c.mu.Unlock()
 	c.publish()

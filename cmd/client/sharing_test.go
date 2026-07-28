@@ -9,6 +9,7 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
+	"github.com/instantmesh/instantmesh/pkg/plan"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
 )
@@ -58,7 +59,7 @@ func TestShareControllerPublishes(t *testing.T) {
 		t.Error("ルーム作成前に配布された")
 	}
 
-	c.bind(zone, store, cl, "hostPK", "10.9.0.1")
+	c.bind(zone, store, cl, "hostPK", "10.9.0.1", "free")
 
 	// ゾーン: 自身の名前とサービス名が自分のメッシュIP へ解決する。
 	host := netip.MustParseAddr("10.9.0.1")
@@ -140,7 +141,7 @@ func TestShareControllerRejectsInvalidPort(t *testing.T) {
 func TestShareControllerReset(t *testing.T) {
 	zone, store, _, cl := hostSession(t)
 	c := newShareController("tanaka")
-	c.bind(zone, store, cl, "hostPK", "10.9.0.1")
+	c.bind(zone, store, cl, "hostPK", "10.9.0.1", "free")
 	if err := c.setPorts([]int{11434}); err != nil {
 		t.Fatalf("setPorts: %v", err)
 	}
@@ -218,5 +219,67 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 	applyPeerAdvert(zone, store, "10.9.0.3", signaling.PeerInfo{Names: []string{"tanaka.mesh"}}, false)
 	if addr, _ := zone.Lookup("tanaka.mesh"); addr != first {
 		t.Errorf("名前が乗っ取られた: %v", addr)
+	}
+}
+
+// TestShareControllerPlanLimit はプランの同時共有サービス数（§5・付録C.9 D-15）を守ることを確かめる。
+func TestShareControllerPlanLimit(t *testing.T) {
+	zone, store, _, cl := hostSession(t)
+	c := newShareController("tanaka")
+	c.bind(zone, store, cl, "hostPK", "10.9.0.1", string(plan.Free))
+
+	free := plan.MustLookup(plan.Free).MaxSharedServices
+	over := make([]int, free+1)
+	for i := range over {
+		over[i] = 20000 + i
+	}
+	if err := c.setPorts(over); !errors.Is(err, errShareLimit) {
+		t.Errorf("err = %v, want errShareLimit", err)
+	}
+	if _, svcs := c.advert(); len(svcs) != 0 {
+		t.Errorf("上限超過の選択が反映された: %+v", svcs)
+	}
+	if err := c.setPorts(over[:free]); err != nil {
+		t.Errorf("上限ちょうどは通るべき: %v", err)
+	}
+
+	// Pro はより多く貸せる。プラン不明（空文字）は無料プランへフェイルセーフ。
+	pro := newShareController("tanaka")
+	pro.bind(meshname.NewZone(), newViewStore(), cl, "hostPK", "10.9.0.1", string(plan.Pro))
+	if err := pro.setPorts(over); err != nil {
+		t.Errorf("Pro で %d 件が拒否された: %v", len(over), err)
+	}
+	unknown := newShareController("tanaka")
+	unknown.bind(meshname.NewZone(), newViewStore(), cl, "hostPK", "10.9.0.1", "")
+	if err := unknown.setPorts(over); !errors.Is(err, errShareLimit) {
+		t.Errorf("プラン不明は無料プラン扱いにすべき: %v", err)
+	}
+}
+
+// TestShareControllerTruncatesOnBind はプラン確定時に、選択済みの超過分を決定的に切り詰めることを
+// 確かめる（上位プランで選んだあと無料プランのルームを作った場合など）。
+func TestShareControllerTruncatesOnBind(t *testing.T) {
+	c := newShareController("tanaka")
+	free := plan.MustLookup(plan.Free).MaxSharedServices
+	ports := make([]int, free+2)
+	for i := range ports {
+		ports[i] = 20000 + i
+	}
+
+	// まず Pro のセッションで上限より多く選ぶ。
+	c.bind(meshname.NewZone(), newViewStore(), nil, "hostPK", "10.9.0.1", string(plan.Pro))
+	if err := c.setPorts(ports); err != nil {
+		t.Fatalf("setPorts: %v", err)
+	}
+	// 次のセッションが無料プランなら、超過分は解除される（残るのは先頭から上限まで）。
+	c.bind(meshname.NewZone(), newViewStore(), nil, "hostPK", "10.9.0.1", string(plan.Free))
+	_, svcs := c.advert()
+	if len(svcs) != free {
+		t.Fatalf("共有数 = %d, want %d", len(svcs), free)
+	}
+	for i, sv := range svcs {
+		if sv.Port != ports[i] {
+			t.Errorf("svcs[%d].Port = %d, want %d（切り詰めは決定的であるべき）", i, sv.Port, ports[i])
+		}
 	}
 }

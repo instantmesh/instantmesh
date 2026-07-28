@@ -219,7 +219,12 @@ func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.share.setPorts(req.Ports); err != nil {
 		slog.Warn("共有設定を適用できません", "err", err)
-		http.Error(w, "共有するポートの指定が不正です", http.StatusBadRequest)
+		// プラン上限は利用者が対処できる失敗なので、理由をそのまま画面へ返す（§5・付録C.9 D-15）。
+		msg := "共有するポートの指定が不正です"
+		if errors.Is(err, errShareLimit) {
+			msg = err.Error()
+		}
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
