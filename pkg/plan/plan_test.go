@@ -66,3 +66,23 @@ func TestMustLookupPanicsOnUnknown(t *testing.T) {
 	}()
 	MustLookup(Tier("nope"))
 }
+
+// TestMaxSharedServices は §5 の表（Free=3 / Pro=10・付録C.9 D-15）と実装値の一致を守る。
+func TestMaxSharedServices(t *testing.T) {
+	if got := MustLookup(Free).MaxSharedServices; got != 3 {
+		t.Errorf("Free.MaxSharedServices = %d, want 3", got)
+	}
+	if got := MustLookup(Pro).MaxSharedServices; got != 10 {
+		t.Errorf("Pro.MaxSharedServices = %d, want 10", got)
+	}
+}
+
+// TestUsageRecords は利用記録の閲覧が有料プラン限定（§5）であることを守る。
+func TestUsageRecords(t *testing.T) {
+	if MustLookup(Free).UsageRecords {
+		t.Error("Free で利用記録を閲覧可能にしている")
+	}
+	if !MustLookup(Pro).UsageRecords {
+		t.Error("Pro で利用記録を閲覧できない")
+	}
+}

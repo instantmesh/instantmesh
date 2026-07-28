@@ -74,9 +74,16 @@ func (c *Client) JoinRequest(token, nickname, guestPubKey string) error {
 
 // --- 双方 ---
 
-// SendPeerInfo は自身の公開鍵と WAN エンドポイントを相手へ中継してもらう。
-func (c *Client) SendPeerInfo(pubKey, wanEndpoint string) error {
-	return c.send(signaling.TypePeerInfo, signaling.PeerInfo{PubKey: pubKey, WANEndpoint: wanEndpoint})
+// SendPeerInfo は自身の公開鍵と WAN エンドポイント、および共有層の広告（自身のメッシュIPへ
+// 解決させたい名前と、共有中サービス）を相手へ中継してもらう。names / services は共有していない
+// 場合 nil でよい。共有内容が変わったら同じメッセージを再送して上書きする。
+func (c *Client) SendPeerInfo(pubKey, wanEndpoint string, names []string, services []signaling.SharedService) error {
+	return c.send(signaling.TypePeerInfo, signaling.PeerInfo{
+		PubKey:      pubKey,
+		WANEndpoint: wanEndpoint,
+		Names:       names,
+		Services:    services,
+	})
 }
 
 // --- 受信 ---

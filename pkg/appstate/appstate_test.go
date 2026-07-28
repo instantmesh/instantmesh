@@ -407,3 +407,65 @@ func TestView(t *testing.T) {
 		t.Fatal("空スライスは非 nil であるべき（JSON []）")
 	}
 }
+
+// TestSetSharedAndMeshName は共有中サービスの表示状態（要件 §4.6）と、到達 URL の組み立てを確かめる。
+func TestSetSharedAndMeshName(t *testing.T) {
+	m := hosting(t)
+	m.SetMeshName("tanaka.mesh")
+	list := []SharedService{
+		{Port: 11434, Label: "Ollama", Name: "ollama.tanaka.mesh", Addr: "10.9.0.1"},
+		{Port: 3001, Name: "", Addr: "10.9.0.1"}, // 名前解決を使わない（IP のみ）
+	}
+	if err := m.SetShared(list); err != nil {
+		t.Fatalf("SetShared: %v", err)
+	}
+	// 呼び出し側のスライス改変が Model へ波及しないこと。
+	list[0].Port = 1
+	if m.Shared[0].Port != 11434 {
+		t.Errorf("SetShared がスライスを共有している: %+v", m.Shared[0])
+	}
+
+	s := m.View()
+	if s.MeshName != "tanaka.mesh" {
+		t.Errorf("MeshName = %q", s.MeshName)
+	}
+	if len(s.Shared) != 2 {
+		t.Fatalf("Shared = %+v", s.Shared)
+	}
+	if s.Shared[0].URL != "http://ollama.tanaka.mesh:11434" || s.Shared[0].MeshURL != "http://10.9.0.1:11434" {
+		t.Errorf("URL = %+v", s.Shared[0])
+	}
+	if s.Shared[1].URL != "" || s.Shared[1].MeshURL != "http://10.9.0.1:3001" {
+		t.Errorf("名前なしの URL = %+v", s.Shared[1])
+	}
+
+	// 空でも JSON で [] になるよう非 nil スライス。
+	if New().View().Shared == nil {
+		t.Error("空の Shared は非 nil であるべき（JSON []）")
+	}
+}
+
+// TestSetSharedInvalidState は接続段階以外での共有反映を拒否することを確かめる。
+func TestSetSharedInvalidState(t *testing.T) {
+	if err := New().SetShared(nil); !errors.Is(err, ErrInvalidState) {
+		t.Errorf("idle: err = %v, want ErrInvalidState", err)
+	}
+	if err := waiting(t).SetShared(nil); !errors.Is(err, ErrInvalidState) {
+		t.Errorf("waiting: err = %v, want ErrInvalidState", err)
+	}
+	// ゲストは接続確立後なら反映できる（ホストからの広告を表示するため）。
+	g := waiting(t)
+	if err := g.Approved("10.9.0.2", "10.9.0.1"); err != nil {
+		t.Fatalf("Approved: %v", err)
+	}
+	if err := g.SetShared([]SharedService{{Port: 11434, Name: "ollama.tanaka.mesh", Addr: "10.9.0.1"}}); err != nil {
+		t.Errorf("guest active: %v", err)
+	}
+}
+
+// TestServiceURLIPv6 は IPv6 リテラルが角括弧で囲まれることを確かめる。
+func TestServiceURLIPv6(t *testing.T) {
+	if got := serviceURL("fd00::1", 11434); got != "http://[fd00::1]:11434" {
+		t.Errorf("serviceURL = %q", got)
+	}
+}

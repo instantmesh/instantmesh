@@ -53,6 +53,15 @@ type Spec struct {
 
 	// RelayThrottledBps は上限到達後の速度制限値（bps）。切断はしない。0 は制限なし。
 	RelayThrottledBps int64
+
+	// MaxSharedServices は同時に共有できるローカルサービス数の上限（要件 §4.6・§5）。
+	// 課金軸は既に「量」から「統制」へ移しているため（付録C の D-4）ここは体験を殺さない値に
+	// 置く。無料でも複数（例: Dify ＋ ローカルLLM）を同時に貸せることを優先する（D-15）。
+	MaxSharedServices int
+
+	// UsageRecords は共有単位・ゲスト単位の利用記録を閲覧できるか（要件 §4.7・§5）。
+	// 計上自体はプランに関わらずホスト側クライアントで行い、閲覧の可否だけをここで分ける。
+	UsageRecords bool
 }
 
 var specs = map[Tier]Spec{
@@ -62,6 +71,8 @@ var specs = map[Tier]Spec{
 		MaxDuration:       1 * time.Hour,
 		RelayByteLimit:    relayFreeByteLimit,
 		RelayThrottledBps: relayThrottleBps,
+		MaxSharedServices: 3,
+		UsageRecords:      false,
 	},
 	Pro: {
 		Tier:              Pro,
@@ -69,6 +80,8 @@ var specs = map[Tier]Spec{
 		MaxDuration:       24 * time.Hour,
 		RelayByteLimit:    0, // 制限緩和
 		RelayThrottledBps: 0,
+		MaxSharedServices: 10,
+		UsageRecords:      true,
 	},
 }
 

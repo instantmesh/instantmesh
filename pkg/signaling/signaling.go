@@ -47,6 +47,7 @@ var (
 	ErrMissingType  = errors.New("signaling: missing message type")
 	ErrUnknownType  = errors.New("signaling: unknown message type")
 	ErrMissingField = errors.New("signaling: missing required field")
+	ErrFieldTooLong = errors.New("signaling: field exceeds allowed size")
 )
 
 // Valid は既知のメッセージ種別かを返す。
@@ -214,16 +215,71 @@ type JoinRejected struct {
 	Reason string `json:"reason"`
 }
 
-// PeerInfo は公開鍵と WAN エンドポイント（"IP:Port"）の交換（ホスト ⇄ ゲスト）。
+// 共有層（要件 §4.6）の広告に対する中継上限。名前・サービスは送信元の自己申告であり、
+// サーバーはそれを解釈せず中継するだけなので、肥大化を防ぐ量的上限のみをスキーマ側で課す。
+// 構文の検証（ラベル規則・ゾーン所属）は受信クライアントが pkg/meshname で行う。
+// MaxPeerNames / MaxPeerNameLen は pkg/meshname の MaxNamesPerPeer / MaxNameLen と同値に保つこと。
+const (
+	MaxPeerNames      = 32
+	MaxPeerNameLen    = 253
+	MaxSharedServices = 32
+	maxPort           = 65535
+)
+
+// SharedService は共有中のローカルサービス 1 件の広告（要件 §4.6）。
+//
+// 表示ラベル（"Ollama" 等）は載せない。受信側が既知ポート表（pkg/localsvc）から自前で導出する
+// ため不要であり、送信元が任意の表示文字列を相手の画面へ流し込める口を作らないためでもある。
+type SharedService struct {
+	// Name は到達名（FQDN）。PeerInfo.Names にも含まれる。
+	Name string `json:"name"`
+	// Port は共有元のポート番号。ゲストは名前とこのポートで URL を組み立てる。
+	Port int `json:"port"`
+}
+
+// PeerInfo は公開鍵・WAN エンドポイント（"IP:Port"）と、共有層の広告（名前・共有中サービス）の
+// 交換（ホスト ⇄ ゲスト）。サーバーは中身を解釈せず相手へ中継する。
 type PeerInfo struct {
 	PubKey      string `json:"pub_key"`
 	WANEndpoint string `json:"wan_endpoint"`
+	// Names は送信元のメッシュIPへ解決させたい名前（FQDN）。受信側はローカルの DNS ゾーンへ
+	// 取り込む（要件 §4.6.3「権威はホスト、解決はローカル」）。省略可。
+	Names []string `json:"names,omitempty"`
+	// Services は共有中サービスの広告。受信側の画面に到達 URL を出すために使う。省略可。
+	Services []SharedService `json:"services,omitempty"`
 }
 
-// Validate は必須フィールドを検証する。
+// Validate は必須フィールドと、共有層の広告の量的上限を検証する。
 func (m PeerInfo) Validate() error {
 	if m.PubKey == "" || m.WANEndpoint == "" {
 		return fmt.Errorf("peer_info: %w", ErrMissingField)
+	}
+	if len(m.Names) > MaxPeerNames || len(m.Services) > MaxSharedServices {
+		return fmt.Errorf("peer_info: %w", ErrFieldTooLong)
+	}
+	for _, n := range m.Names {
+		if err := validPeerName(n); err != nil {
+			return err
+		}
+	}
+	for _, s := range m.Services {
+		if err := validPeerName(s.Name); err != nil {
+			return err
+		}
+		if s.Port < 1 || s.Port > maxPort {
+			return fmt.Errorf("peer_info: service port %d: %w", s.Port, ErrMissingField)
+		}
+	}
+	return nil
+}
+
+// validPeerName は広告名の空・長さのみを検査する（構文は受信クライアント側の責務）。
+func validPeerName(n string) error {
+	switch {
+	case n == "":
+		return fmt.Errorf("peer_info: name: %w", ErrMissingField)
+	case len(n) > MaxPeerNameLen:
+		return fmt.Errorf("peer_info: name: %w", ErrFieldTooLong)
 	}
 	return nil
 }
