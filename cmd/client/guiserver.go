@@ -129,6 +129,8 @@ func (s *guiServer) handler() http.Handler {
 	mux.HandleFunc("GET /api/services", s.guard(s.handleServices))
 	mux.HandleFunc("GET /api/usage", s.guard(s.handleUsage))
 	mux.HandleFunc("POST /api/share", s.guard(s.handleShare))
+	mux.HandleFunc("GET /api/control", s.guard(s.handleControl))
+	mux.HandleFunc("POST /api/control", s.guard(s.handleControlUpdate))
 	mux.HandleFunc("POST /api/host", s.guard(s.handleHost))
 	mux.HandleFunc("POST /api/join", s.guard(s.handleJoin))
 	mux.HandleFunc("POST /api/approve", s.guard(s.handleApprove))
@@ -243,6 +245,82 @@ func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleControl は統制（アクセスキー・上限）の現在値を返す（要件 §4.7）。
+func (s *guiServer) handleControl(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(s.share.control())
+}
+
+// handleControlUpdate は統制の操作をまとめて受ける（要件 §4.7・有料プラン機能）。
+// body の例:
+//
+//	{"requireKey": true}                                  … キー要求の切替
+//	{"issueKey": "<ゲスト公開鍵>"}                          … キー発行（応答に key を含む）
+//	{"revokeKey": "<ゲスト公開鍵>"}                         … キー失効（キックとは独立）
+//	{"limit": {"pubKey": "...", "maxBytes": 0, "maxRequests": 100}} … ゲスト単位の上限
+func (s *guiServer) handleControlUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RequireKey *bool  `json:"requireKey"`
+		IssueKey   string `json:"issueKey"`
+		RevokeKey  string `json:"revokeKey"`
+		Limit      *struct {
+			PubKey      string `json:"pubKey"`
+			MaxBytes    int64  `json:"maxBytes"`
+			MaxRequests int64  `json:"maxRequests"`
+		} `json:"limit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "操作の指定が不正です", http.StatusBadRequest)
+		return
+	}
+
+	resp := map[string]any{}
+	if req.RequireKey != nil {
+		if err := s.share.setRequireKey(*req.RequireKey); err != nil {
+			s.writeControlErr(w, err)
+			return
+		}
+	}
+	if req.IssueKey != "" {
+		key, err := s.share.issueKey(req.IssueKey)
+		if err != nil {
+			s.writeControlErr(w, err)
+			return
+		}
+		resp["key"] = key
+	}
+	if req.RevokeKey != "" {
+		s.share.revokeKey(req.RevokeKey)
+	}
+	if req.Limit != nil {
+		ip, ok := s.store.guestIP(req.Limit.PubKey)
+		if !ok {
+			http.Error(w, "対象のゲストが参加していません", http.StatusBadRequest)
+			return
+		}
+		l := usage.Limit{MaxBytes: req.Limit.MaxBytes, MaxRequests: req.Limit.MaxRequests}
+		if err := s.share.setGuestLimit(ip, l); err != nil {
+			s.writeControlErr(w, err)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeControlErr は統制操作の失敗を HTTP 応答へ写す。
+func (s *guiServer) writeControlErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errControlPlan):
+		http.Error(w, "この機能は有料プランでのみ利用できます", http.StatusPaymentRequired)
+	case errors.Is(err, errControlUnavailable):
+		http.Error(w, "仮想NIC（-tunnel）が有効でないため適用できません", http.StatusConflict)
+	default:
+		slog.Warn("統制操作に失敗", "err", err)
+		http.Error(w, "操作を適用できませんでした", http.StatusBadRequest)
+	}
 }
 
 // handleHost はホストとしてセッションを開始する。body は任意で {"duration": 秒}。

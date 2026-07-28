@@ -117,8 +117,17 @@ func halfClose(c net.Conn) {
 // （bind 失敗が「使用中」かの判定 isAddrInUseErr は OS ごとにエラー値が異なるため
 // addrinuse_{windows,other}.go に置く。）
 
+// portListener は 1 共有サービス分の待受（生 TCP 転送 / HTTP プロキシ）。
+type portListener interface {
+	addr() net.Addr
+	close()
+}
+
 // serviceForwarder は共有中サービスぶんの転送をまとめて管理する。共有内容の変更で差分適用し、
 // 共有から外れたポートは直ちに解放する。
+//
+// gate が非 nil のときは生 TCP 転送ではなく HTTP プロキシとして待ち受け、ゲストごとのキーと
+// 上限を強制する（要件 §4.7・付録C.9 D-16）。この場合、共有できるのは HTTP のサービスに限られる。
 type serviceForwarder struct {
 	addr netip.Addr // 待受アドレス（自身のメッシュIP）
 
@@ -128,8 +137,11 @@ type serviceForwarder struct {
 	// dial は転送先への接続（テストでフェイクへ差し替え可能）。
 	dial func(network, addr string) (net.Conn, error)
 
+	// gate は L7（HTTP）の統制層。nil なら生 TCP 転送のまま（統制なし）。
+	gate *l7Gate
+
 	mu     sync.Mutex
-	active map[int]*forwarder
+	active map[int]portListener
 	closed bool
 }
 
@@ -139,13 +151,31 @@ func newServiceForwarder(ctx context.Context, addr netip.Addr) *serviceForwarder
 		addr:      addr,
 		targetFor: func(port int) string { return net.JoinHostPort("localhost", strconv.Itoa(port)) },
 		dial:      net.Dial,
-		active:    make(map[int]*forwarder),
+		active:    make(map[int]portListener),
 	}
 	go func() {
 		<-ctx.Done()
 		s.closeAll()
 	}()
 	return s
+}
+
+// setGate は L7 統制の有効/無効を切り替える。既存の待受は張り替えが要るため一度すべて閉じ、
+// 次の apply で開き直す（共有停止と同じ即時解放の経路を通る）。
+func (s *serviceForwarder) setGate(g *l7Gate) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	same := (s.gate == nil) == (g == nil)
+	s.gate = g
+	if !same {
+		for port, l := range s.active {
+			l.close()
+			delete(s.active, port)
+		}
+	}
+	s.mu.Unlock()
 }
 
 // apply は共有中ポート集合に合わせて転送を差分適用する（s が nil なら何もしない）。
@@ -176,7 +206,7 @@ func (s *serviceForwarder) apply(ports []int) {
 		if _, ok := s.active[port]; ok {
 			continue
 		}
-		f, err := startForwarder(netip.AddrPortFrom(s.addr, uint16(port)), s.targetFor(port), s.dial)
+		f, err := s.start(port)
 		if err != nil {
 			if isAddrInUseErr(err) {
 				// サービス自身が全アドレスで待ち受けている＝メッシュIP で直接到達できる。
@@ -187,8 +217,18 @@ func (s *serviceForwarder) apply(ports []int) {
 			continue
 		}
 		s.active[port] = f
-		slog.Info("共有サービスの転送を開始しました", "listen", f.addr().String(), "target", s.targetFor(port))
+		slog.Info("共有サービスの転送を開始しました",
+			"listen", f.addr().String(), "target", s.targetFor(port), "l7", s.gate != nil)
 	}
+}
+
+// start は 1 ポート分の待受を開始する（呼び出し側でロック済みであること）。
+func (s *serviceForwarder) start(port int) (portListener, error) {
+	listen := netip.AddrPortFrom(s.addr, uint16(port))
+	if s.gate != nil {
+		return startHTTPProxy(listen, s.targetFor(port), uint16(port), s.gate)
+	}
+	return startForwarder(listen, s.targetFor(port), s.dial)
 }
 
 // closeAll は全ての転送を解放する（ルーム解散・退出・プロセス終了時）。

@@ -106,7 +106,7 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 
 ### GUI（クライアントの LocalAPI 層）
 
-クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET /api/usage` は利用記録＝Pro 限定）。
+クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET /api/usage` は利用記録、`GET/POST /api/control` はアクセスキーと上限＝いずれも Pro 限定）。
 
 - **UI とコアの分離**: GUI とヘッドレス CLI（`-mode host`/`guest`）は同一の受信ループ（`runHost`/`runGuest`）を駆動する。表示状態は `pkg/appstate`（ゴルーチンセーフなビューモデル）に集約し、GUI・CLI とも購読する（設計原則1）。
 - **セキュリティ**: `/api/*` は `pkg/originguard` で同一オリジン以外（CSRF・DNS リバインディング）を fail-closed で 403。127.0.0.1 のみに bind し、WireGuard 秘密鍵などの復号鍵は API に一切載せない（配信は公開鍵・招待・表示メタデータのみ）。
@@ -141,5 +141,6 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 
 - 要件: `docs/要件定義書.md`（機能/非機能/プラン/状態遷移のマスター）
 - アーキテクチャ: `docs/システムアーキテクチャ定義書.md`
+- 実機検証（CI で検証できない特権・実 OS・実 NAT の範囲）: `docs/実機検証チェックリスト.md`
 - 開発ルール: 本ファイル（`CLAUDE.md`）の「設計原則」節に一元化
 - 進捗・パッケージ一覧: `TODO.md`（`pkg/` 全パッケージの役割と状態を網羅。新規パッケージを足したらここも更新する）

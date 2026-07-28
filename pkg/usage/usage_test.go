@@ -76,3 +76,55 @@ func TestForgetAndReset(t *testing.T) {
 		t.Errorf("Reset 後の合計 = %d / %d", in, out)
 	}
 }
+
+func TestRequestsAndLimits(t *testing.T) {
+	r := New()
+	now := time.Now()
+	alice := netip.MustParseAddr("10.0.0.2")
+	bob := netip.MustParseAddr("10.0.0.3")
+
+	r.AddRequest(alice, 11434, now)
+	r.AddRequest(alice, 11434, now)
+	if got := r.Snapshot()[0].Requests; got != 2 {
+		t.Errorf("Requests = %d, want 2", got)
+	}
+
+	// 上限未設定なら常に超過しない。
+	if r.Exceeded(alice) {
+		t.Error("上限未設定で超過扱いになった")
+	}
+	// リクエスト数の上限。
+	r.SetLimit(alice, Limit{MaxRequests: 2})
+	if !r.Exceeded(alice) {
+		t.Error("リクエスト上限に達したのに超過でない")
+	}
+	if r.Exceeded(bob) {
+		t.Error("他のゲストまで超過扱いになった（当該ゲストのみを遮断すべき）")
+	}
+	if got := r.LimitFor(alice); got.MaxRequests != 2 {
+		t.Errorf("LimitFor = %+v", got)
+	}
+
+	// バイト数の上限（送受信の合計で判定）。
+	r.SetLimit(bob, Limit{MaxBytes: 100})
+	r.AddIn(bob, 11434, 60, now)
+	if r.Exceeded(bob) {
+		t.Error("上限未達で超過扱いになった")
+	}
+	r.AddOut(bob, 11434, 40, now)
+	if !r.Exceeded(bob) {
+		t.Error("送受信合計で上限に達したのに超過でない")
+	}
+
+	// ゼロ値で解除できる。
+	r.SetLimit(alice, Limit{})
+	if r.Exceeded(alice) {
+		t.Error("上限を解除しても超過のまま")
+	}
+
+	// Forget は上限も一緒に消す。
+	r.Forget(bob)
+	if got := r.LimitFor(bob); got.MaxBytes != 0 {
+		t.Errorf("Forget 後も上限が残る: %+v", got)
+	}
+}
