@@ -244,9 +244,20 @@ func TestShareControllerConcurrentEdits(t *testing.T) {
 	}
 	wg.Wait()
 
-	// いずれかの名前で決着し、ゾーンと表示が整合していること（どの名前になるかは競合次第）。
+	// どの名前で決着するかは競合次第だが、publish は直列化されるため最後の適用は直近の状態に
+	// なる。ゾーンには自分のメッシュIP 向けの登録だけが残り、決着した名前が引ける。
+	host := netip.MustParseAddr("10.9.0.1")
+	entries := zone.Entries()
+	if len(entries) == 0 {
+		t.Fatal("ゾーンが空になった")
+	}
+	for _, e := range entries {
+		if e.Addr != host {
+			t.Errorf("%s = %v, want %v", e.Name, e.Addr, host)
+		}
+	}
 	got := c.settings()
-	if addr, ok := zone.Lookup(got.MeshName); !ok || addr != netip.MustParseAddr("10.9.0.1") {
+	if addr, ok := zone.Lookup(got.MeshName); !ok || addr != host {
 		t.Errorf("決着した名前 %q がゾーンと不整合: %v, %v", got.MeshName, addr, ok)
 	}
 }

@@ -73,6 +73,11 @@ func meshHostLabel(candidates ...string) string {
 type shareController struct {
 	label string // メッシュ名のホストラベル（例 "tanaka"）
 
+	// pubMu は publish（状態の取得 → ゾーン・転送・到達制御・再広告への適用）を直列化する。
+	// 取得と適用を分けると、並行操作で古い内容が新しい内容を上書きしうる（外れたポートの待受が
+	// 残る・古い名前が配られる）。mu より先に取ること（この順序以外で両方を取らない）。
+	pubMu sync.Mutex
+
 	mu       sync.Mutex
 	ports    []int
 	maxPorts int                  // 同時共有サービス数の上限（プラン由来・ルーム作成時に確定）
@@ -294,9 +299,14 @@ func (c *shareController) advert() ([]string, []signaling.SharedService) {
 	return names, svcs
 }
 
-// publish は現在の共有内容を Zone・表示状態・ピアへ反映する。ルーム作成前（addr 未確定）は
-// 何もしない（bind 時に改めて反映される）。
+// publish は現在の共有内容を Zone・転送・到達制御・表示状態・ピアへ反映する。ルーム作成前
+// （addr 未確定）は何もしない（bind 時に改めて反映される）。
+//
+// pubMu で直列化するため、GUI の操作が並行しても適用の順序は入れ替わらない。最後に走る publish は
+// 直近の状態（ラベル・選択）を取ってから適用するので、外れたポートの待受が残ることはない。
 func (c *shareController) publish() {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
 	addr, zone, store, client, pubKey, endpoint, fwd, tunl := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd, c.tun
 	gate := c.gateLocked()
