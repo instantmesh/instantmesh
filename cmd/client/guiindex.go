@@ -73,6 +73,8 @@ var servicesLoading = false;
 var selected = null;
 // 利用記録（要件 §4.7・閲覧は有料プラン）。/api/state とは別に緩やかな間隔で取得する。
 var usage = null;
+// アクセス統制（要件 §4.7・有料プラン）。キー要求の状態と発行済みキー。
+var control = null;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -114,6 +116,59 @@ function idleHTML() {
       '<label>ニックネーム<input id="nick" type="text" placeholder="alice"></label>' +
       '<button id="btn-join">参加する</button>' +
     '</section>';
+}
+
+async function loadControl() {
+  try {
+    control = await (await fetch('/api/control')).json();
+  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+}
+
+// postControl は統制の操作を送り、結果（発行されたキー等）を取り込んで再描画する。
+async function postControl(body) {
+  try {
+    var res = await fetch('/api/control', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      errBox.hidden = false;
+      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + (await res.text());
+    }
+  } catch (e) {
+    errBox.hidden = false;
+    errBox.textContent = '通信エラー: ' + e;
+  }
+  await loadControl();
+  if (lastSnap) render(lastSnap);
+}
+
+// controlSection はゲストごとのアクセスキーを提示する（§4.7）。キーはホストが帯域外で
+// ゲストへ渡し、ゲストは既存ツールの API キー欄（Authorization: Bearer）に設定する。
+function controlSection(s) {
+  if (!control) return '';
+  if (!control.available) {
+    return '<section class="card"><h2>アクセス統制</h2>' +
+      '<p class="muted">ゲストごとのアクセスキーと利用上限は有料プランの機能です。' +
+      '無料プランでは、承認したゲストは共有中のサービスへ制限なく到達できます。</p></section>';
+  }
+  var approved = s.guests.filter(function(g) { return g.state === 'approved'; });
+  var rows = approved.map(function(g) {
+    var key = (control.keys || {})[g.pubKey];
+    var right = key
+      ? '<button data-copy="' + esc(key) + '">キーをコピー</button>' +
+        '<button class="danger" data-revoke-key="' + esc(g.pubKey) + '">失効</button>'
+      : '<button data-issue-key="' + esc(g.pubKey) + '">キーを発行</button>';
+    return '<li class="row"><div><b>' + esc(g.nickname) + '</b><br>' +
+      (key ? '<code>' + esc(key) + '</code>' : '<span class="muted">未発行</span>') + '</div>' +
+      '<div class="actions">' + right + '</div></li>';
+  }).join('');
+  return '<section class="card"><h2>アクセス統制</h2>' +
+    '<p class="muted">キーの要求は<b>' + (control.requireKey ? '有効' : '無効') + '</b>です。' +
+    '有効にすると、共有サービスは HTTP プロキシ経由になり、キーの無い要求を 401 で拒否します' +
+    '（HTTP のサービスが対象）。キーの失効はキックとは独立に行えます。</p>' +
+    (rows ? '<ul>' + rows + '</ul>' : '<p class="muted">承認済みのゲストがいません。</p>') +
+    '<div class="actions"><button id="btn-require-key">キー要求を' +
+    (control.requireKey ? '無効化' : '有効化') + '</button></div></section>';
 }
 
 async function loadUsage() {
@@ -246,6 +301,7 @@ function hostingHTML(s) {
     servicesSection(s) +
     sharedSection(s) +
     usageSection(s) +
+    controlSection(s) +
     '<section class="card"><h2>待合室（' + pending.length + '）</h2>' + pendingBody + '</section>' +
     '<section class="card"><h2>参加者（' + approved.length + '）</h2>' + approvedBody + '</section>' +
     peersSection(s);
@@ -317,6 +373,16 @@ function wire(s) {
     for (var p in selected) { if (selected[p]) ports.push(parseInt(p, 10)); }
     post('/api/share', {ports: ports});
   };
+  var rk = document.getElementById('btn-require-key');
+  if (rk) rk.onclick = function() { postControl({requireKey: !(control && control.requireKey)}); };
+  var iks = document.querySelectorAll('[data-issue-key]');
+  for (var q = 0; q < iks.length; q++) (function(b) {
+    b.onclick = function() { postControl({issueKey: b.getAttribute('data-issue-key')}); };
+  })(iks[q]);
+  var rks = document.querySelectorAll('[data-revoke-key]');
+  for (var w = 0; w < rks.length; w++) (function(b) {
+    b.onclick = function() { postControl({revokeKey: b.getAttribute('data-revoke-key')}); };
+  })(rks[w]);
   var cbs = document.querySelectorAll('[data-port]');
   for (var m = 0; m < cbs.length; m++) (function(b) {
     b.onchange = function() { selected[b.getAttribute('data-port')] = b.checked; };
@@ -339,11 +405,12 @@ function render(s) {
   if (s.error) { errBox.hidden = false; errBox.textContent = 'エラー: ' + s.error; } else { errBox.hidden = true; }
   // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
   if (s.phase === 'hosting' && services === null) loadServices();
+  if (s.phase === 'hosting' && control === null) loadControl();
   // ホストを離れたら結果と選択を捨て、次にホストになったとき再走査・再復元させる。
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
-  if (s.phase !== 'hosting') { selected = null; usage = null; }
+  if (s.phase !== 'hosting') { selected = null; usage = null; control = null; }
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage);
+  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
@@ -358,7 +425,9 @@ async function poll() {
 }
 setInterval(poll, 1000);
 // 利用記録はホスト画面でのみ、5 秒間隔で更新する（毎秒の再描画を避ける）。
-setInterval(function() { if (lastSnap && lastSnap.phase === 'hosting') loadUsage(); }, 5000);
+setInterval(function() {
+  if (lastSnap && lastSnap.phase === 'hosting') { loadUsage(); if (!control) loadControl(); }
+}, 5000);
 poll();
 </script>
 </body>

@@ -29,14 +29,26 @@ type Record struct {
 	BytesIn int64 `json:"bytesIn"`
 	// BytesOut はホストからピアへ流れたバイト数（応答）。推論の応答はこちらに乗る。
 	BytesOut int64 `json:"bytesOut"`
+	// Requests は共有サービスへのリクエスト数（L7 で数えた場合のみ。L4 のみの経路では 0）。
+	Requests int64 `json:"requests"`
 	// FirstSeen / LastSeen は最初と直近の観測時刻。
 	FirstSeen time.Time `json:"firstSeen"`
 	LastSeen  time.Time `json:"lastSeen"`
 }
 
+// Limit はゲスト単位の上限（要件 §4.7・有料プラン機能）。0 は無制限。
+// 超過時に遮断するのは**当該ゲストのみ**で、ルーム全体には影響させない。
+type Limit struct {
+	// MaxBytes は送受信の合計バイト数の上限。
+	MaxBytes int64 `json:"maxBytes"`
+	// MaxRequests はリクエスト数の上限。
+	MaxRequests int64 `json:"maxRequests"`
+}
+
 // entry は内部の集計値。
 type entry struct {
 	in, out             int64
+	requests            int64
 	firstSeen, lastSeen time.Time
 }
 
@@ -44,11 +56,12 @@ type entry struct {
 type Recorder struct {
 	mu      sync.Mutex
 	entries map[Key]*entry
+	limits  map[netip.Addr]Limit
 }
 
 // New は空の集計器を返す。
 func New() *Recorder {
-	return &Recorder{entries: make(map[Key]*entry)}
+	return &Recorder{entries: make(map[Key]*entry), limits: make(map[netip.Addr]Limit)}
 }
 
 // AddIn はピア → ホスト方向のバイト数を計上する。
@@ -61,7 +74,58 @@ func (r *Recorder) AddOut(peer netip.Addr, port uint16, n int, now time.Time) {
 	r.add(Key{Peer: peer, Port: port}, 0, int64(n), now)
 }
 
+// AddRequest はリクエスト 1 件を計上する（L7 ゲートを通る共有サービスのみ）。
+func (r *Recorder) AddRequest(peer netip.Addr, port uint16, now time.Time) {
+	r.addWith(Key{Peer: peer, Port: port}, now, func(e *entry) { e.requests++ })
+}
+
+// SetLimit はゲスト単位の上限を設定する（ゼロ値の Limit で解除）。
+func (r *Recorder) SetLimit(peer netip.Addr, l Limit) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l.MaxBytes <= 0 && l.MaxRequests <= 0 {
+		delete(r.limits, peer)
+		return
+	}
+	r.limits[peer] = l
+}
+
+// LimitFor はゲストに設定された上限を返す（未設定はゼロ値＝無制限）。
+func (r *Recorder) LimitFor(peer netip.Addr) Limit {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.limits[peer]
+}
+
+// Exceeded はゲストが上限に達しているかを返す。上限未設定なら常に false。
+// 判定に使うのは当該ゲストの全共有サービスの合計。
+func (r *Recorder) Exceeded(peer netip.Addr) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	l, ok := r.limits[peer]
+	if !ok {
+		return false
+	}
+	var bytes, reqs int64
+	for k, e := range r.entries {
+		if k.Peer != peer {
+			continue
+		}
+		bytes += e.in + e.out
+		reqs += e.requests
+	}
+	return (l.MaxBytes > 0 && bytes >= l.MaxBytes) || (l.MaxRequests > 0 && reqs >= l.MaxRequests)
+}
+
 func (r *Recorder) add(k Key, in, out int64, now time.Time) {
+	r.addWith(k, now, func(e *entry) {
+		e.in += in
+		e.out += out
+	})
+}
+
+// addWith は計上単位を解決し、apply で集計値を更新する。
+func (r *Recorder) addWith(k Key, now time.Time, apply func(*entry)) {
 	if !k.Peer.IsValid() || k.Port == 0 {
 		return // 計上単位を特定できないものは記録しない
 	}
@@ -72,8 +136,7 @@ func (r *Recorder) add(k Key, in, out int64, now time.Time) {
 		e = &entry{firstSeen: now}
 		r.entries[k] = e
 	}
-	e.in += in
-	e.out += out
+	apply(e)
 	e.lastSeen = now
 }
 
@@ -88,6 +151,7 @@ func (r *Recorder) Snapshot() []Record {
 			Port:      int(k.Port),
 			BytesIn:   e.in,
 			BytesOut:  e.out,
+			Requests:  e.requests,
 			FirstSeen: e.firstSeen,
 			LastSeen:  e.lastSeen,
 		})
@@ -121,6 +185,7 @@ func (r *Recorder) Forget(peer netip.Addr) {
 			delete(r.entries, k)
 		}
 	}
+	delete(r.limits, peer)
 }
 
 // Reset は全ての記録を消す（セッション終了時）。
@@ -128,4 +193,5 @@ func (r *Recorder) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	clear(r.entries)
+	clear(r.limits)
 }

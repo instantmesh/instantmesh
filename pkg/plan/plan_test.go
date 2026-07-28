@@ -86,3 +86,19 @@ func TestUsageRecords(t *testing.T) {
 		t.Error("Pro で利用記録を閲覧できない")
 	}
 }
+
+// TestControlFeatures は統制機能（アクセスキー・ゲスト単位上限）が有料プラン限定（§5）で
+// あることを守る。共有そのものは無料に置く（付録C.3）。
+func TestControlFeatures(t *testing.T) {
+	free, pro := MustLookup(Free), MustLookup(Pro)
+	if free.AccessKeys || free.GuestLimits {
+		t.Error("無料プランで統制機能を有効にしている")
+	}
+	if !pro.AccessKeys || !pro.GuestLimits {
+		t.Error("有料プランで統制機能が無効になっている")
+	}
+	// 共有そのもの（同時共有数 > 0）は無料でも使える。
+	if free.MaxSharedServices <= 0 {
+		t.Error("無料プランで共有できない")
+	}
+}

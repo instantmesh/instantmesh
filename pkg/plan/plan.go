@@ -62,6 +62,14 @@ type Spec struct {
 	// UsageRecords は共有単位・ゲスト単位の利用記録を閲覧できるか（要件 §4.7・§5）。
 	// 計上自体はプランに関わらずホスト側クライアントで行い、閲覧の可否だけをここで分ける。
 	UsageRecords bool
+
+	// AccessKeys はゲストごとのアクセスキーを要求できるか（要件 §4.7・§5）。
+	// 認証機構を持たないローカル推論エンドポイントに、外から鍵を被せる機能。
+	AccessKeys bool
+
+	// GuestLimits はゲスト単位の利用上限（転送量・リクエスト数）を設定できるか（同上）。
+	// 超過時に遮断するのは当該ゲストのみで、ルーム全体には影響させない。
+	GuestLimits bool
 }
 
 var specs = map[Tier]Spec{
@@ -73,6 +81,8 @@ var specs = map[Tier]Spec{
 		RelayThrottledBps: relayThrottleBps,
 		MaxSharedServices: 3,
 		UsageRecords:      false,
+		AccessKeys:        false,
+		GuestLimits:       false,
 	},
 	Pro: {
 		Tier:              Pro,
@@ -82,6 +92,8 @@ var specs = map[Tier]Spec{
 		RelayThrottledBps: 0,
 		MaxSharedServices: 10,
 		UsageRecords:      true,
+		AccessKeys:        true,
+		GuestLimits:       true,
 	},
 }
 

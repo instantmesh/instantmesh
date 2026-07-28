@@ -18,7 +18,9 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/instantmesh/instantmesh/pkg/accesskey"
 	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
@@ -34,6 +36,12 @@ const defaultMeshLabel = "host"
 // errShareLimit はプランの同時共有サービス数（pkg/plan の MaxSharedServices・要件 §5）を超えた
 // 選択を表す。UI はこれを利用者向けの案内に写す。
 var errShareLimit = errors.New("sharing: plan limit for concurrent shared services")
+
+// errControlPlan は統制機能（アクセスキー・ゲスト単位上限）が現在のプランで使えないことを表す。
+var errControlPlan = errors.New("sharing: control features require the paid plan")
+
+// errControlUnavailable は仮想NIC が無く統制を適用できないことを表す（-tunnel 無効時）。
+var errControlUnavailable = errors.New("sharing: control features require the tunnel")
 
 // meshHostLabel はメッシュ名に使うラベルを決める（-mesh-name 指定 > OS のホスト名 > "host"）。
 // 名前はセッションをまたいで安定していることに価値がある（ゲストの .env や手順書に書ける・
@@ -59,6 +67,10 @@ type shareController struct {
 	ports    []int
 	maxPorts int                  // 同時共有サービス数の上限（プラン由来・ルーム作成時に確定）
 	usageOK  bool                 // 利用記録を閲覧できるプランか（§5・有料機能）
+	keysOK   bool                 // ゲストごとのアクセスキーを使えるプランか（同上）
+	limitsOK bool                 // ゲスト単位の上限を設定できるプランか（同上）
+	reqKey   bool                 // 共有サービスへアクセスキーを要求する（ホストの明示操作）
+	keys     *accesskey.Registry  // 発行済みキー（メモリ内のみ・設計原則3）
 	addr     netip.Addr           // 自身のメッシュIP（ルーム作成後に確定）
 	endpoint string               // STUN で発見した WAN エンドポイント（peer_info 再送に使う）
 	client   *signalclient.Client // 再広告の送出先（セッション確立後に確定）
@@ -73,7 +85,11 @@ type shareController struct {
 // セッション固有の依存（ゾーン・表示状態・接続・プラン）は bind で与える。
 // ルーム作成前は上限を無料プランの値に置く（プランはルーム作成時にサーバーが確定させるため）。
 func newShareController(label string) *shareController {
-	return &shareController{label: label, maxPorts: plan.MustLookup(plan.Free).MaxSharedServices}
+	return &shareController{
+		label:    label,
+		maxPorts: plan.MustLookup(plan.Free).MaxSharedServices,
+		keys:     accesskey.New(),
+	}
 }
 
 // shareSession はセッション確立時に共有コントローラへ与える依存一式。
@@ -106,7 +122,10 @@ func (c *shareController) bind(sess shareSession) {
 	c.zone, c.store, c.client, c.pubKey, c.addr = zone, store, client, pubKey, addr
 	c.fwd, c.tun = sess.fwd, sess.tun
 	c.maxPorts = spec.MaxSharedServices
-	c.usageOK = spec.UsageRecords
+	c.usageOK, c.keysOK, c.limitsOK = spec.UsageRecords, spec.AccessKeys, spec.GuestLimits
+	if !c.keysOK {
+		c.reqKey = false // プランが下がったらキー要求も落とす（フェイルセーフ）
+	}
 	// プランが確定した結果、選択済みのポートが上限を超えている場合は先頭から上限までに切り詰める
 	// （Candidates と同じ決定的な順序で残すため、超過分の切り捨ても決定的になる）。
 	if len(c.ports) > c.maxPorts {
@@ -124,8 +143,10 @@ func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd, c.tun = nil, netip.Addr{}, "", nil, "", nil, nil, nil, nil
-	c.maxPorts = plan.MustLookup(plan.Free).MaxSharedServices
-	c.usageOK = plan.MustLookup(plan.Free).UsageRecords
+	free := plan.MustLookup(plan.Free)
+	c.maxPorts, c.usageOK, c.keysOK, c.limitsOK = free.MaxSharedServices, free.UsageRecords, free.AccessKeys, free.GuestLimits
+	c.reqKey = false
+	c.keys.Reset()
 }
 
 // setPorts は共有するポート集合を設定し、名前配布と表示へ反映する。共有の実行はホストの明示的な
@@ -194,6 +215,7 @@ func (c *shareController) advert() ([]string, []signaling.SharedService) {
 func (c *shareController) publish() {
 	c.mu.Lock()
 	addr, zone, store, client, pubKey, endpoint, fwd, tunl := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd, c.tun
+	gate := c.gateLocked()
 	c.mu.Unlock()
 	if !addr.IsValid() {
 		return
@@ -206,6 +228,7 @@ func (c *shareController) publish() {
 	for _, sv := range svcs {
 		ports = append(ports, sv.Port)
 	}
+	fwd.setGate(gate)
 	fwd.apply(ports)
 	// 到達制御へも同じ集合を反映する。選ばれていないポートへの新規接続はここで落ちる（D-11）。
 	if tunl != nil {
@@ -240,6 +263,103 @@ func (c *shareController) publish() {
 	if err := client.SendPeerInfo(pubKey, endpoint, names, svcs); err != nil {
 		slog.Warn("共有内容の再広告に失敗しました", "err", err)
 	}
+}
+
+// gateLocked は現在の設定に応じた L7 ゲートを返す（呼び出し側でロック済みであること）。
+// キーを要求しない場合でも、上限が設定されていれば HTTP で数えるためゲートを立てる。
+// 到達制御（L4）のみで足りる場合は nil を返し、生 TCP 転送のままにする。
+func (c *shareController) gateLocked() *l7Gate {
+	if c.tun == nil || (!c.reqKey && !c.limitsOK) {
+		return nil
+	}
+	if !c.reqKey && !c.hasLimitsLocked() {
+		return nil
+	}
+	return &l7Gate{keys: c.keys, rec: c.tun.Usage(), now: time.Now, requireKey: c.reqKey}
+}
+
+// hasLimitsLocked はいずれかのゲストに上限が設定されているかを返す。
+func (c *shareController) hasLimitsLocked() bool {
+	if c.tun == nil || c.store == nil {
+		return false
+	}
+	for _, g := range c.store.snapshot().Guests {
+		if addr, err := netip.ParseAddr(g.AssignedIP); err == nil {
+			if l := c.tun.Usage().LimitFor(addr); l.MaxBytes > 0 || l.MaxRequests > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// setRequireKey は共有サービスへアクセスキーを要求するかを切り替える（有料プラン機能）。
+func (c *shareController) setRequireKey(on bool) error {
+	c.mu.Lock()
+	if on && !c.keysOK {
+		c.mu.Unlock()
+		return errControlPlan
+	}
+	c.reqKey = on
+	c.mu.Unlock()
+	c.publish() // 待受を張り替える（生 TCP 転送 ⇄ HTTP プロキシ）
+	return nil
+}
+
+// issueKey はゲストへアクセスキーを発行する（再発行なら旧キーは即時失効）。
+func (c *shareController) issueKey(guest string) (string, error) {
+	c.mu.Lock()
+	ok, keys := c.keysOK, c.keys
+	c.mu.Unlock()
+	if !ok {
+		return "", errControlPlan
+	}
+	return keys.Issue(guest)
+}
+
+// revokeKey はゲストのアクセスキーを失効させる（キックとは独立）。
+func (c *shareController) revokeKey(guest string) { c.keys.Revoke(guest) }
+
+// setGuestLimit はゲスト単位の上限を設定する（有料プラン機能）。guestIP は当該ゲストのメッシュIP。
+func (c *shareController) setGuestLimit(guestIP string, l usage.Limit) error {
+	addr, err := netip.ParseAddr(guestIP)
+	if err != nil {
+		return fmt.Errorf("ゲストのメッシュIP %q: %w", guestIP, err)
+	}
+	c.mu.Lock()
+	ok, tunl := c.limitsOK, c.tun
+	c.mu.Unlock()
+	if !ok {
+		return errControlPlan
+	}
+	if tunl == nil {
+		return errControlUnavailable
+	}
+	tunl.Usage().SetLimit(addr, l)
+	c.publish() // 上限が付いたら L7 で数える必要があるため待受を見直す
+	return nil
+}
+
+// controlView は統制の表示状態（GUI 向け）。
+type controlView struct {
+	Available  bool              `json:"available"`  // 有料プランで統制機能を使えるか
+	RequireKey bool              `json:"requireKey"` // アクセスキーを要求中か
+	Keys       map[string]string `json:"keys"`       // ゲスト公開鍵 → 発行済みキー
+}
+
+// control は統制の現在値を返す。キーはホストが帯域外でゲストへ渡すため、そのまま載せる
+// （LocalAPI は 127.0.0.1 限定＋originguard 保護下）。
+func (c *shareController) control() controlView {
+	c.mu.Lock()
+	available, reqKey, keys := c.keysOK, c.reqKey, c.keys
+	c.mu.Unlock()
+	m := make(map[string]string)
+	for _, g := range keys.Guests() {
+		if k, ok := keys.KeyFor(g); ok {
+			m[g] = k
+		}
+	}
+	return controlView{Available: available, RequireKey: reqKey, Keys: m}
 }
 
 // applyPeerAdvert は受信した peer_info の広告をローカルへ取り込む。peerIP は送信元ピアの

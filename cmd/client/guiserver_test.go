@@ -108,7 +108,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 		{"POST", "/api/host"}, {"POST", "/api/join"}, {"POST", "/api/approve"},
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
 		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
-		{"GET", "/api/services"}, {"POST", "/api/share"}, {"GET", "/api/usage"},
+		{"GET", "/api/services"}, {"POST", "/api/share"}, {"GET", "/api/usage"}, {"GET", "/api/control"}, {"POST", "/api/control"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -651,5 +651,68 @@ func TestGUIServerUsage(t *testing.T) {
 	}
 	if body.Records == nil {
 		t.Error("records は空配列であるべき（null 不可）")
+	}
+}
+
+// TestGUIServerControl は統制（アクセスキー・上限）が有料プラン限定で、無料プランでは
+// 402 を返すことを確かめる（§4.7・§5）。
+func TestGUIServerControl(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	// 既定（無料プラン）では利用不可。
+	rec := do(t, gs, "GET", "/api/control", "")
+	var view controlView
+	if err := json.NewDecoder(rec.Body).Decode(&view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Available || view.RequireKey || len(view.Keys) != 0 {
+		t.Errorf("無料プランで統制が有効になっている: %+v", view)
+	}
+	if rec := do(t, gs, "POST", "/api/control", `{"requireKey":true}`); rec.Code != http.StatusPaymentRequired {
+		t.Errorf("キー要求: status=%d, want 402", rec.Code)
+	}
+	if rec := do(t, gs, "POST", "/api/control", `{"issueKey":"guest-pk"}`); rec.Code != http.StatusPaymentRequired {
+		t.Errorf("キー発行: status=%d, want 402", rec.Code)
+	}
+	if rec := do(t, gs, "POST", "/api/control", "not-json"); rec.Code != http.StatusBadRequest {
+		t.Errorf("不正な body: status=%d, want 400", rec.Code)
+	}
+
+	// 有料プランならキーを発行でき、失効もできる。
+	gs.share.mu.Lock()
+	gs.share.keysOK = true
+	gs.share.mu.Unlock()
+
+	rec = do(t, gs, "POST", "/api/control", `{"issueKey":"guest-pk"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("キー発行: status=%d", rec.Code)
+	}
+	var issued struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&issued); err != nil || issued.Key == "" {
+		t.Fatalf("発行されたキー = %q, err = %v", issued.Key, err)
+	}
+	if rec := do(t, gs, "POST", "/api/control", `{"requireKey":true}`); rec.Code != http.StatusOK {
+		t.Errorf("キー要求の有効化: status=%d", rec.Code)
+	}
+	rec = do(t, gs, "GET", "/api/control", "")
+	view = controlView{}
+	_ = json.NewDecoder(rec.Body).Decode(&view)
+	if !view.Available || !view.RequireKey || view.Keys["guest-pk"] != issued.Key {
+		t.Errorf("統制の状態 = %+v", view)
+	}
+
+	if rec := do(t, gs, "POST", "/api/control", `{"revokeKey":"guest-pk"}`); rec.Code != http.StatusOK {
+		t.Errorf("キー失効: status=%d", rec.Code)
+	}
+	if _, ok := gs.share.keys.KeyFor("guest-pk"); ok {
+		t.Error("失効後もキーが残っている")
+	}
+
+	// 参加していないゲストへの上限設定は 400。
+	if rec := do(t, gs, "POST", "/api/control", `{"limit":{"pubKey":"nobody","maxRequests":10}}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("未参加ゲストへの上限: status=%d, want 400", rec.Code)
 	}
 }
