@@ -26,6 +26,7 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/originguard"
 	"github.com/instantmesh/instantmesh/pkg/qr"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
+	"github.com/instantmesh/instantmesh/pkg/usage"
 )
 
 // GUI ハートビートの既定値。ブラウザ SPA の /api/state ポーリング（1 秒間隔）を生存信号とみなし、
@@ -47,14 +48,17 @@ var errSessionActive = errors.New("gui: session already active")
 // guiOptions は GUI から開始するセッションへ渡す既定オプション（CLI フラグ由来）。招待リンクや
 // ニックネームなどブラウザ操作で決まる値は含めない。
 type guiOptions struct {
-	server    string // ホスト時のシグナリング URL（ゲストは招待リンク内の server を使う）
-	account   string // ホスト認証トークン（Cognito 未設定時の Bearer）
-	duration  int64  // ルーム制限時間（秒）の既定値
-	useTunnel bool
-	ifname    string
-	stunAddr  string
-	relay     bool
-	cognito   cognitoConfig // 設定時はホスト開始時に PKCE サインインで ID トークンを取得
+	server     string // ホスト時のシグナリング URL（ゲストは招待リンク内の server を使う）
+	account    string // ホスト認証トークン（Cognito 未設定時の Bearer）
+	duration   int64  // ルーム制限時間（秒）の既定値
+	useTunnel  bool
+	ifname     string
+	stunAddr   string
+	relay      bool
+	cognito    cognitoConfig // 設定時はホスト開始時に PKCE サインインで ID トークンを取得
+	meshName   string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
+	useDNS     bool          // 共有サービスの名前解決を有効にする
+	shareGuard bool          // 共有していない宛先への到達を遮断する
 }
 
 // guiServer は GUI 用の状態保持＋HTTP 配信＋セッション制御を担う。store は受信ループ（唯一の
@@ -89,6 +93,10 @@ type guiServer struct {
 
 	// probeDial はローカルサービス検出の TCP connect（テストでフェイクへ差し替え可能）。既定は dialTCP。
 	probeDial dialFunc
+
+	// share はホストの共有状態（どのローカルサービスを貸すか）。プロセス常駐でセッションを
+	// またぐため 1 つを保持し、セッション開始時に reset して引き継がない。
+	share *shareController
 }
 
 // newGUIServer は初期状態（Idle）の GUI サーバーを返す。baseCtx はサーバーのライフサイクル
@@ -102,6 +110,7 @@ func newGUIServer(baseCtx context.Context, opts guiOptions) *guiServer {
 		startHost:  runHost,
 		startGuest: runGuest,
 		probeDial:  dialTCP,
+		share:      newShareController(meshHostLabel(opts.meshName)),
 	}
 	s.touchHeartbeat()
 	return s
@@ -118,6 +127,8 @@ func (s *guiServer) handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.guard(s.handleState))
 	mux.HandleFunc("GET /api/qr", s.guard(s.handleQR))
 	mux.HandleFunc("GET /api/services", s.guard(s.handleServices))
+	mux.HandleFunc("GET /api/usage", s.guard(s.handleUsage))
+	mux.HandleFunc("POST /api/share", s.guard(s.handleShare))
 	mux.HandleFunc("POST /api/host", s.guard(s.handleHost))
 	mux.HandleFunc("POST /api/join", s.guard(s.handleJoin))
 	mux.HandleFunc("POST /api/approve", s.guard(s.handleApprove))
@@ -198,6 +209,42 @@ func (s *guiServer) handleServices(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"services": cands})
 }
 
+// handleUsage は共有サービスの利用記録（要件 §4.7）を返す。閲覧は有料プラン限定（§5）で、
+// 無料プラン・記録が無い場合は available=false を返して画面側で案内する。
+// 記録するのは接続メタデータと数量のみで、通信内容（プロンプト・応答本文）は含まない。
+func (s *guiServer) handleUsage(w http.ResponseWriter, r *http.Request) {
+	records, ok := s.share.usageRecords()
+	if records == nil {
+		records = []usage.Record{}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"available": ok, "records": records})
+}
+
+// handleShare は共有するローカルサービス（ポート集合）を設定する。body は {"ports": [11434, ...]}。
+// 共有可否はホストの明示選択によるという要件（§4.6.1）の入口で、ここで選ばれたものだけが名前解決の
+// 配布対象になる。空配列を送れば共有を全て止められる（要件 §4.6.4 の即時解放と同じ考え方）。
+func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Ports []int `json:"ports"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "共有ポート（ports）が必要です", http.StatusBadRequest)
+		return
+	}
+	if err := s.share.setPorts(req.Ports); err != nil {
+		slog.Warn("共有設定を適用できません", "err", err)
+		// プラン上限は利用者が対処できる失敗なので、理由をそのまま画面へ返す（§5・付録C.9 D-15）。
+		msg := "共有するポートの指定が不正です"
+		if errors.Is(err, errShareLimit) {
+			msg = err.Error()
+		}
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleHost はホストとしてセッションを開始する。body は任意で {"duration": 秒}。
 func (s *guiServer) handleHost(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -208,11 +255,14 @@ func (s *guiServer) handleHost(w http.ResponseWriter, r *http.Request) {
 	if dur <= 0 {
 		dur = s.opts.duration
 	}
+	// 前セッションの共有内容（IP・接続・選択ポート）は引き継がない。
+	s.share.reset()
 	cfg := hostConfig{
 		server: s.opts.server, account: s.opts.account, durationSec: dur,
 		auto:      false, // GUI では人が待合室で承認するため自動承認しない
 		useTunnel: s.opts.useTunnel, ifname: s.opts.ifname, stunAddr: s.opts.stunAddr,
 		relay: s.opts.relay, stdinConsole: false, cognito: s.opts.cognito,
+		meshName: s.opts.meshName, useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard, share: s.share,
 	}
 	// Cognito サインインは既定ブラウザで開く。ログイン完了後の認証タブの扱いを GUI の表示方法で分ける:
 	//   - アプリ内ウィンドウ（WebView）表示: ルーム情報はウィンドウ側に出るため、認証タブを GUI へ
@@ -246,6 +296,7 @@ func (s *guiServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	cfg := guestConfig{
 		inviteURL: req.Invite, nick: nick, useTunnel: s.opts.useTunnel,
 		ifname: s.opts.ifname, stunAddr: s.opts.stunAddr, relay: s.opts.relay,
+		useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard,
 	}
 	err := s.startSession(func(ctx context.Context) error {
 		return s.startGuest(ctx, cfg, s.store, s.setClient)

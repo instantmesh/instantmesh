@@ -4,6 +4,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/instantmesh/instantmesh/pkg/meshname"
 )
 
 func TestKnownServicesReturnsCopy(t *testing.T) {
@@ -141,5 +143,85 @@ func TestCandidatesInvalidPort(t *testing.T) {
 	}
 	if _, err := Candidates(nil, []int{70000}); !errors.Is(err, ErrInvalidPort) {
 		t.Errorf("manual に範囲外: err = %v, want ErrInvalidPort", err)
+	}
+}
+
+func TestNameLabel(t *testing.T) {
+	tests := []struct {
+		port int
+		want string
+	}{
+		{11434, "ollama"},
+		{1234, "lmstudio"},
+		{8000, "vllm"},
+		{8080, "openwebui"},
+		{3000, "dev"},
+		{80, "dify"},
+		{3001, "port-3001"},
+		{0, ""},
+		{70000, ""},
+	}
+	for _, tt := range tests {
+		if got := NameLabel(tt.port); got != tt.want {
+			t.Errorf("NameLabel(%d) = %q, want %q", tt.port, got, tt.want)
+		}
+	}
+}
+
+// TestNameLabelIsValidLabel は表のスラッグがすべて DNS ラベルとして妥当であることを守る
+// （既知ポート表へ行を足したときに壊れないようにする）。
+func TestNameLabelIsValidLabel(t *testing.T) {
+	for _, k := range knownServices {
+		if err := meshname.ValidateLabel(k.Slug); err != nil {
+			t.Errorf("ポート %d のスラッグ %q が不正: %v", k.Port, k.Slug, err)
+		}
+	}
+}
+
+func TestAdvertise(t *testing.T) {
+	names, shared, err := Advertise("tanaka", []int{3001, 11434})
+	if err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	// 先頭はホスト自身の名前。以降は Candidates と同じ順（既知ポート → 表にないポートの昇順）。
+	wantNames := []string{"tanaka.mesh", "ollama.tanaka.mesh", "port-3001.tanaka.mesh"}
+	if !reflect.DeepEqual(names, wantNames) {
+		t.Errorf("names = %v, want %v", names, wantNames)
+	}
+	wantShared := []SharedName{
+		{Port: 11434, Label: "Ollama", Name: "ollama.tanaka.mesh"},
+		{Port: 3001, Name: "port-3001.tanaka.mesh"},
+	}
+	if !reflect.DeepEqual(shared, wantShared) {
+		t.Errorf("shared = %+v, want %+v", shared, wantShared)
+	}
+}
+
+// TestAdvertiseNoPorts は 1 件も共有していなくてもホスト自身の名前は配ることを確かめる
+// （名前解決はピア単位の仕組みで、そのピアの全ポートに等しく効くため）。
+func TestAdvertiseNoPorts(t *testing.T) {
+	names, shared, err := Advertise("tanaka", nil)
+	if err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	if !reflect.DeepEqual(names, []string{"tanaka.mesh"}) || len(shared) != 0 {
+		t.Errorf("names = %v, shared = %v", names, shared)
+	}
+}
+
+func TestAdvertiseErrors(t *testing.T) {
+	if _, _, err := Advertise("tanaka", []int{0}); !errors.Is(err, ErrInvalidPort) {
+		t.Errorf("範囲外ポート: err = %v, want ErrInvalidPort", err)
+	}
+	if _, _, err := Advertise("Bad Label", []int{11434}); !errors.Is(err, meshname.ErrInvalidLabel) {
+		t.Errorf("不正ラベル: err = %v, want ErrInvalidLabel", err)
+	}
+	// 名前数の上限（ホスト名 1 + サービス数）を超えたら広告を作らない。
+	many := make([]int, meshname.MaxNamesPerPeer)
+	for i := range many {
+		many[i] = 20000 + i
+	}
+	if _, _, err := Advertise("tanaka", many); !errors.Is(err, meshname.ErrTooManyNames) {
+		t.Errorf("上限超過: err = %v, want ErrTooManyNames", err)
 	}
 }

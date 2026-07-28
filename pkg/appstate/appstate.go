@@ -12,6 +12,8 @@ package appstate
 
 import (
 	"errors"
+	"net"
+	"strconv"
 
 	"github.com/instantmesh/instantmesh/pkg/invite"
 	"github.com/instantmesh/instantmesh/pkg/token"
@@ -90,6 +92,18 @@ type Peer struct {
 	Route  Route
 }
 
+// SharedService は共有中のローカルサービス 1 件の表示情報（要件 §4.6）。ホストは自身が共有して
+// いるもの、ゲストはホストから広告されたものを同じ形で持つ。
+//
+// Label は既知ポート表（pkg/localsvc）から各クライアントが自前で導出した値であり、相手から
+// 受け取った表示文字列ではない（任意の文字列を相手の画面へ流し込ませないため）。
+type SharedService struct {
+	Port  int
+	Label string
+	Name  string // 到達名（FQDN・要件 §4.6.2 経路(1)）。名前解決を使わない場合は空
+	Addr  string // 共有元のメッシュIP（同 経路(2)）
+}
+
 // Model は GUI が描画するアプリ状態一式。ゼロ値は使わず New で初期化する。
 type Model struct {
 	Role       Role
@@ -103,10 +117,12 @@ type Model struct {
 	Nickname   string // ゲスト: 自称ニックネーム
 	AssignedIP string // ゲスト: 自身に割り当てられたメッシュ IP
 	HostIP     string // ホストのメッシュ IP（ホスト=自身の払出 IP／ゲスト=接続先ホストの IP）
+	MeshName   string // ホストのメッシュ名（例 "tanaka.mesh"。ホスト=自身／ゲスト=接続先ホスト。名前解決を使わない場合は空）
 	Guests     []Guest
 	Peers      []Peer
-	Reason     string // Closed の理由（拒否理由・解散理由）
-	ErrMsg     string // 直近の非致命エラーの表示文言
+	Shared     []SharedService // 共有中のローカルサービス（ホスト=共有選択の結果／ゲスト=受信した広告）
+	Reason     string          // Closed の理由（拒否理由・解散理由）
+	ErrMsg     string          // 直近の非致命エラーの表示文言
 }
 
 // New は初期状態（Idle・役割未確定）の Model を返す。
@@ -304,6 +320,22 @@ func (m *Model) PeerUp(pubKey string, route Route) error {
 	return nil
 }
 
+// SetMeshName はメッシュ名（ホスト=自身の名前／ゲスト=接続先ホストの名前）を反映する。
+// 名前は自己申告・未検証であり、信頼の根拠は SAS による公開鍵の帯域外照合である（要件 §4.6.3）。
+func (m *Model) SetMeshName(name string) {
+	m.MeshName = name
+}
+
+// SetShared は共有中サービス一覧を置き換える（ホストの共有選択・ゲストの広告受信のいずれも同じ形）。
+// 接続段階（ホスト稼働中／ゲスト接続確立済み）でのみ有効。
+func (m *Model) SetShared(list []SharedService) error {
+	if m.Phase != PhaseHosting && m.Phase != PhaseActive {
+		return ErrInvalidState
+	}
+	m.Shared = append([]SharedService(nil), list...)
+	return nil
+}
+
 // Close はルーム解散・退出・致命的エラーで終了状態へ遷移する（どのフェーズからでも有効）。
 func (m *Model) Close(reason string) {
 	m.Phase = PhaseClosed
@@ -364,18 +396,32 @@ func (m *Model) removePeer(pubKey string) {
 
 // Snapshot は Model を JSON へ写した表示用スナップショット。
 type Snapshot struct {
-	Role       string      `json:"role"`
-	Phase      string      `json:"phase"`
-	RoomID     string      `json:"roomId,omitempty"`
-	InviteLink string      `json:"inviteLink,omitempty"`
-	SAS        string      `json:"sas,omitempty"`
-	Nickname   string      `json:"nickname,omitempty"`
-	AssignedIP string      `json:"assignedIp,omitempty"`
-	HostIP     string      `json:"hostIp,omitempty"`
-	Guests     []GuestView `json:"guests"`
-	Peers      []PeerView  `json:"peers"`
-	Reason     string      `json:"reason,omitempty"`
-	ErrMsg     string      `json:"error,omitempty"`
+	Role       string       `json:"role"`
+	Phase      string       `json:"phase"`
+	RoomID     string       `json:"roomId,omitempty"`
+	InviteLink string       `json:"inviteLink,omitempty"`
+	SAS        string       `json:"sas,omitempty"`
+	Nickname   string       `json:"nickname,omitempty"`
+	AssignedIP string       `json:"assignedIp,omitempty"`
+	HostIP     string       `json:"hostIp,omitempty"`
+	MeshName   string       `json:"meshName,omitempty"`
+	Guests     []GuestView  `json:"guests"`
+	Peers      []PeerView   `json:"peers"`
+	Shared     []SharedView `json:"shared"`
+	Reason     string       `json:"reason,omitempty"`
+	ErrMsg     string       `json:"error,omitempty"`
+}
+
+// SharedView は Snapshot 内の共有中サービス 1 件。到達 URL は UI 側で組み立てず、ここで
+// 完成形（スキーム込み）を渡す。UI にはコピーさせるだけの役割を残す（設計原則1）。
+type SharedView struct {
+	Port  int    `json:"port"`
+	Label string `json:"label,omitempty"`
+	Name  string `json:"name,omitempty"`
+	// URL は名前解決による到達 URL（要件 §4.6.2 経路(1)。名前が無ければ空）。
+	URL string `json:"url,omitempty"`
+	// MeshURL はメッシュIP 直接の到達 URL（同 経路(2)。常に利用可能）。
+	MeshURL string `json:"meshUrl,omitempty"`
 }
 
 // GuestView は Snapshot 内のゲスト 1 名分。
@@ -405,10 +451,12 @@ func (m *Model) View() Snapshot {
 		Nickname:   m.Nickname,
 		AssignedIP: m.AssignedIP,
 		HostIP:     m.HostIP,
+		MeshName:   m.MeshName,
 		Reason:     m.Reason,
 		ErrMsg:     m.ErrMsg,
 		Guests:     make([]GuestView, 0, len(m.Guests)),
 		Peers:      make([]PeerView, 0, len(m.Peers)),
+		Shared:     make([]SharedView, 0, len(m.Shared)),
 	}
 	for _, g := range m.Guests {
 		s.Guests = append(s.Guests, GuestView{
@@ -422,7 +470,26 @@ func (m *Model) View() Snapshot {
 	for _, p := range m.Peers {
 		s.Peers = append(s.Peers, PeerView{PubKey: p.PubKey, Route: p.Route.String()})
 	}
+	for _, sv := range m.Shared {
+		s.Shared = append(s.Shared, SharedView{
+			Port:    sv.Port,
+			Label:   sv.Label,
+			Name:    sv.Name,
+			URL:     serviceURL(sv.Name, sv.Port),
+			MeshURL: serviceURL(sv.Addr, sv.Port),
+		})
+	}
 	return s
+}
+
+// serviceURL は到達 URL を組み立てる（host が空なら空文字）。UI が `http://` を含む完全な URL を
+// コピーできるようにするための組み立てで、未知TLD をブラウザが検索語として扱う問題を避ける
+// （要件 §4.6.3）。IPv6 リテラルは角括弧で囲む。
+func serviceURL(host string, port int) string {
+	if host == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // String は Role の表示名を返す。

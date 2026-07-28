@@ -125,8 +125,10 @@ func TestSendMethods(t *testing.T) {
 		t.Errorf("type = %q, want rotate_token", env.Type)
 	}
 
-	// peer_info
-	if err := c.SendPeerInfo("myPK", "198.51.100.1:51820"); err != nil {
+	// peer_info（共有層の広告つき）
+	names := []string{"tanaka.mesh", "ollama.tanaka.mesh"}
+	svcs := []signaling.SharedService{{Name: "ollama.tanaka.mesh", Port: 11434}}
+	if err := c.SendPeerInfo("myPK", "198.51.100.1:51820", names, svcs); err != nil {
 		t.Fatal(err)
 	}
 	env = lastSent(t, fc)
@@ -134,6 +136,12 @@ func TestSendMethods(t *testing.T) {
 	_ = env.Unmarshal(&pi)
 	if env.Type != signaling.TypePeerInfo || pi.PubKey != "myPK" || pi.WANEndpoint != "198.51.100.1:51820" {
 		t.Errorf("peer_info 不正: %+v", pi)
+	}
+	if len(pi.Names) != 2 || pi.Names[1] != "ollama.tanaka.mesh" {
+		t.Errorf("names = %v", pi.Names)
+	}
+	if len(pi.Services) != 1 || pi.Services[0].Port != 11434 {
+		t.Errorf("services = %+v", pi.Services)
 	}
 }
 

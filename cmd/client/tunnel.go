@@ -11,6 +11,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/instantmesh/instantmesh/pkg/netcfg"
+	"github.com/instantmesh/instantmesh/pkg/usage"
 	"github.com/instantmesh/instantmesh/pkg/wgconf"
 	"github.com/instantmesh/instantmesh/pkg/wgstat"
 )
@@ -30,6 +31,11 @@ type Tunnel struct {
 	dev  *device.Device
 	bind *sharedBind
 	name string
+	// filter は共有していない宛先への到達を落とし、共有サービスの通信量を計上する層
+	// （付録C.9 D-11）。到達制御を無効化して起動した場合は nil。
+	filter *filterDevice
+	// usage は共有サービスの利用記録（要件 §4.7）。ホスト側クライアントで計上する。
+	usage *usage.Recorder
 	// configureLinkFn は解決済みの netcfg.Plan を実インターフェースへ適用する OS 依存関数。
 	// 既定は configureLink（OS別実装）。テストではフェイクへ差し替える。
 	configureLinkFn func(ifName string, plan netcfg.Plan) error
@@ -42,7 +48,7 @@ type Tunnel struct {
 // OpenTunnel は名前 ifName の TUN デバイスを作成し、初期設定 cfg を適用して起動する。
 // ifName は OS により制約がある（Linux: 任意名、macOS: "utun"/"utunN"、Windows: 任意名で Wintun）。
 // 初回は管理者/root 権限が必要。
-func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
+func OpenTunnel(ifName string, cfg wgconf.Config, shareGuard bool) (*Tunnel, error) {
 	// Windows では wireguard-go が仮想NIC作成時に wintun.dll を実行時ロードする。埋め込んだ
 	// dll を実行ファイル隣へ配置してから CreateTUN する（非 Windows では no-op）。これにより
 	// 配布物は単一 exe で完結する。
@@ -62,7 +68,17 @@ func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
 	// WireGuard と STUN で同一の UDP ソケットを共有する bind を使う。これにより STUN で観測する
 	// WAN マッピングが WireGuard の送信マッピングと一致し、NAT hole punching が成立する。
 	bind := newSharedBind()
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelError, "wg("+name+") "))
+
+	// 共有していない宛先への到達を落とし、共有サービスの通信量を計上する層を挟む（D-11）。
+	// メッシュIP が確定するまでは素通しで、SetSharedPorts で有効になる。
+	rec := usage.New()
+	var filter *filterDevice
+	inner := tunDev
+	if shareGuard {
+		filter = newFilterDevice(tunDev, rec, time.Now)
+		inner = filter
+	}
+	dev := device.NewDevice(inner, bind, device.NewLogger(device.LogLevelError, "wg("+name+") "))
 
 	uapi, err := cfg.UAPI()
 	if err != nil {
@@ -77,8 +93,21 @@ func OpenTunnel(ifName string, cfg wgconf.Config) (*Tunnel, error) {
 		dev.Close()
 		return nil, fmt.Errorf("wg 起動: %w", err)
 	}
-	return &Tunnel{dev: dev, bind: bind, name: name, configureLinkFn: configureLink, localPrefixesFn: localOnlinkPrefixes}, nil
+	return &Tunnel{
+		dev: dev, bind: bind, name: name, filter: filter, usage: rec,
+		configureLinkFn: configureLink, localPrefixesFn: localOnlinkPrefixes,
+	}, nil
 }
+
+// SetSharedPorts は「自身のメッシュIP 宛のうち、どのポートを受け入れるか」を到達制御へ反映する
+// （付録C.9 D-11）。共有中サービス以外への新規接続は落ちるようになる。ICMP（疎通確認）と
+// 名前解決の :53 は共有の有無に関わらず通る。到達制御が無効な場合は何もしない。
+func (t *Tunnel) SetSharedPorts(self netip.Addr, ports []int) {
+	applyFilterPolicy(t.filter, self, ports)
+}
+
+// Usage は共有サービスの利用記録を返す（要件 §4.7）。到達制御が無効でも記録器自体は存在する。
+func (t *Tunnel) Usage() *usage.Recorder { return t.usage }
 
 // Apply は差分設定（ピアの追加/更新/削除など）を適用する。
 func (t *Tunnel) Apply(cfg wgconf.Config) error {
