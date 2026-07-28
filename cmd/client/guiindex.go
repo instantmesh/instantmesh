@@ -71,6 +71,8 @@ var servicesLoading = false;
 // （要件 §4.6.1）、検出結果とは別に保持し、「共有を更新」を押したときだけサーバーへ送る。
 // null = 未初期化（ホスト画面に入ったときサーバー側の共有中一覧から復元する）。
 var selected = null;
+// 利用記録（要件 §4.7・閲覧は有料プラン）。/api/state とは別に緩やかな間隔で取得する。
+var usage = null;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -112,6 +114,39 @@ function idleHTML() {
       '<label>ニックネーム<input id="nick" type="text" placeholder="alice"></label>' +
       '<button id="btn-join">参加する</button>' +
     '</section>';
+}
+
+async function loadUsage() {
+  try {
+    var res = await fetch('/api/usage');
+    usage = await res.json();
+  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+}
+
+function fmtBytes(n) {
+  n = Number(n || 0);
+  var u = ['B', 'KB', 'MB', 'GB'];
+  var i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+}
+
+// usageSection は共有サービスの利用記録を提示する（ホスト側でのみ計上・§4.7）。
+// 記録するのは接続メタデータと数量だけで、プロンプトや応答本文は一切含まない。
+function usageSection(s) {
+  if (!usage) return '';
+  if (!usage.available) {
+    return '<section class="card"><h2>利用記録</h2>' +
+      '<p class="muted">共有先ごとの利用記録（接続時刻・転送量）は有料プランの機能です。' +
+      '記録するのは数量と接続メタデータのみで、プロンプトや応答本文は保存しません。</p></section>';
+  }
+  var rows = (usage.records || []).map(function(v) {
+    return '<li class="row"><div><code>' + esc(v.peer) + '</code> <span class="muted">:' + v.port + '</span></div>' +
+      '<div class="muted">受信 ' + fmtBytes(v.bytesIn) + ' / 送信 ' + fmtBytes(v.bytesOut) + '</div></li>';
+  }).join('');
+  return '<section class="card"><h2>利用記録（' + (usage.records || []).length + '）</h2>' +
+    '<p class="muted">共有したサービスへの、ゲストごとの通信量です。記録は手元のみで、サーバーへは送りません。</p>' +
+    (rows ? '<ul>' + rows + '</ul>' : '<p class="muted">まだ利用はありません。</p>') + '</section>';
 }
 
 async function loadServices() {
@@ -210,6 +245,7 @@ function hostingHTML(s) {
     '</section>' +
     servicesSection(s) +
     sharedSection(s) +
+    usageSection(s) +
     '<section class="card"><h2>待合室（' + pending.length + '）</h2>' + pendingBody + '</section>' +
     '<section class="card"><h2>参加者（' + approved.length + '）</h2>' + approvedBody + '</section>' +
     peersSection(s);
@@ -305,9 +341,9 @@ function render(s) {
   if (s.phase === 'hosting' && services === null) loadServices();
   // ホストを離れたら結果と選択を捨て、次にホストになったとき再走査・再復元させる。
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
-  if (s.phase !== 'hosting') selected = null;
+  if (s.phase !== 'hosting') { selected = null; usage = null; }
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected);
+  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
@@ -321,6 +357,8 @@ async function poll() {
   } catch (e) { /* 一時的な取得失敗は無視して次のポーリングで回復する */ }
 }
 setInterval(poll, 1000);
+// 利用記録はホスト画面でのみ、5 秒間隔で更新する（毎秒の再描画を避ける）。
+setInterval(function() { if (lastSnap && lastSnap.phase === 'hosting') loadUsage(); }, 5000);
 poll();
 </script>
 </body>

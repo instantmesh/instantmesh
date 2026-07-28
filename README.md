@@ -8,7 +8,7 @@
 
 > **2026-07-27 方向転換**: 前面に出す姿を「汎用の一時メッシュVPN」から「ローカルAI／MCP の一時貸与」へ寄せました。汎用メッシュ機能は削らず土台として残します。判断の根拠・却下した代替案・残存リスクは [`docs/要件定義書.md` 付録C](docs/要件定義書.md) を参照。
 
-> **ステータス**: フェーズ1の**実装が進行中**です。`docs/` に要件・アーキテクチャ・規約、`CLAUDE.md` に開発ルール、`.claude/skills/` に実装スキルを整備し、コア実装として `pkg/` 配下に UI/トランスポート非依存の純粋ロジック **35 パッケージ（ユニットテスト100%）** と、シグナリング＋リレーサーバー `cmd/server`・クライアント `cmd/client`（既定は GUI モード。ヘッドレス CLI の host/guest も持つ）を実装済みです。制御プレーン（ルーム作成・待合室承認・キック・エフェメラル管理）とデータプレーン（リレー中継・通信量制限）、クライアントの鍵生成・招待リンク（帯域外MITM照合）・STUN・wireguard-go 設定・仮想NICへのIP付与・**P2P直通の成否検知とリレーへの自動フォールバック**・**GUI（LocalAPI＋埋め込み SPA。Windows は WebView2・Linux は Chromium `--app` のアプリ内ウィンドウ）**・**Cognito 認証（PKCE）／S3 監査**までが動作します。**2台の実機（ParrotOS×2・VMware NAT モード）でメッシュ疎通（仮想NIC生成・割当IP経由の `ping`）を確認済み**です。残りは独立した実NAT間での穴あけ確立／直通⇄リレー切替の疎通検証（今回は同一 NAT 配下のため経路判定は未確認）です。進捗の詳細は [`TODO.md`](TODO.md) を参照。
+> **ステータス**: フェーズ1の**実装が進行中**です。`docs/` に要件・アーキテクチャ・規約、`CLAUDE.md` に開発ルール、`.claude/skills/` に実装スキルを整備し、コア実装として `pkg/` 配下に UI/トランスポート非依存の純粋ロジック **37 パッケージ（ユニットテスト100%）** と、シグナリング＋リレーサーバー `cmd/server`・クライアント `cmd/client`（既定は GUI モード。ヘッドレス CLI の host/guest も持つ）を実装済みです。制御プレーン（ルーム作成・待合室承認・キック・エフェメラル管理）とデータプレーン（リレー中継・通信量制限）、クライアントの鍵生成・招待リンク（帯域外MITM照合）・STUN・wireguard-go 設定・仮想NICへのIP付与・**P2P直通の成否検知とリレーへの自動フォールバック**・**GUI（LocalAPI＋埋め込み SPA。Windows は WebView2・Linux は Chromium `--app` のアプリ内ウィンドウ）**・**Cognito 認証（PKCE）／S3 監査**までが動作します。**2台の実機（ParrotOS×2・VMware NAT モード）でメッシュ疎通（仮想NIC生成・割当IP経由の `ping`）を確認済み**です。残りは独立した実NAT間での穴あけ確立／直通⇄リレー切替の疎通検証（今回は同一 NAT 配下のため経路判定は未確認）です。進捗の詳細は [`TODO.md`](TODO.md) を参照。
 
 ---
 
@@ -213,7 +213,7 @@ instant-mesh/
     ├── relay / relayhub / relayframe               # データプレーン（リレー中継・通信量メータ/スロットル・ワイヤフレーム）
     ├── stun / stunmux / wgstat / connmon           # NATトラバーサル（STUN・WGソケット相乗り・直通成否検知・直通⇄リレー状態機械）
     ├── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
-    └── localsvc / meshname / dnsmsg                # 共有層（ローカルサービスの既知ポート表・共有候補の組み立て／`.mesh` 名前空間と名前⇄メッシュIPの写像／DNS メッセージの解析・応答組み立て）
+    └── localsvc / meshname / dnsmsg / pktfilter / usage  # 共有層（ローカルサービスの既知ポート表・共有候補の組み立て／`.mesh` 名前空間と名前⇄メッシュIPの写像／DNS メッセージの解析・応答組み立て／共有していない宛先の遮断判定／利用記録の集計）
 ```
 
 各パッケージの役割と進捗は [`TODO.md`](TODO.md) を参照。テストカバレッジは CI（GitHub Actions）の `go test ./... -cover` で確認でき、純粋ロジック（`pkg/`）は全パッケージ 100% カバレッジを維持しています。

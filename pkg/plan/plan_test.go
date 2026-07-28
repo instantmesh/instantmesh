@@ -76,3 +76,13 @@ func TestMaxSharedServices(t *testing.T) {
 		t.Errorf("Pro.MaxSharedServices = %d, want 10", got)
 	}
 }
+
+// TestUsageRecords は利用記録の閲覧が有料プラン限定（§5）であることを守る。
+func TestUsageRecords(t *testing.T) {
+	if MustLookup(Free).UsageRecords {
+		t.Error("Free で利用記録を閲覧可能にしている")
+	}
+	if !MustLookup(Pro).UsageRecords {
+		t.Error("Pro で利用記録を閲覧できない")
+	}
+}

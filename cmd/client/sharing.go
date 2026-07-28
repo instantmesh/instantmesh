@@ -25,6 +25,7 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/plan"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
+	"github.com/instantmesh/instantmesh/pkg/usage"
 )
 
 // defaultMeshLabel は OS のホスト名からラベルを導出できなかった場合の代替。
@@ -57,6 +58,7 @@ type shareController struct {
 	mu       sync.Mutex
 	ports    []int
 	maxPorts int                  // 同時共有サービス数の上限（プラン由来・ルーム作成時に確定）
+	usageOK  bool                 // 利用記録を閲覧できるプランか（§5・有料機能）
 	addr     netip.Addr           // 自身のメッシュIP（ルーム作成後に確定）
 	endpoint string               // STUN で発見した WAN エンドポイント（peer_info 再送に使う）
 	client   *signalclient.Client // 再広告の送出先（セッション確立後に確定）
@@ -64,6 +66,7 @@ type shareController struct {
 	zone     *meshname.Zone
 	store    *viewStore
 	fwd      *serviceForwarder
+	tun      *Tunnel
 }
 
 // newShareController は指定ラベルの共有コントローラを返す。セッション開始前に生成してよく、
@@ -79,6 +82,7 @@ type shareSession struct {
 	store  *viewStore
 	client *signalclient.Client
 	fwd    *serviceForwarder // 共有サービスへの転送（nil 可＝-tunnel 無効時）
+	tun    *Tunnel           // 到達制御（共有していない宛先を落とす）の適用先（nil 可）
 	pubKey string
 	hostIP string
 	tier   string // サーバーが確定させたプラン（空ならフェイルセーフに無料プラン）
@@ -100,8 +104,9 @@ func (c *shareController) bind(sess shareSession) {
 	}
 	c.mu.Lock()
 	c.zone, c.store, c.client, c.pubKey, c.addr = zone, store, client, pubKey, addr
-	c.fwd = sess.fwd
+	c.fwd, c.tun = sess.fwd, sess.tun
 	c.maxPorts = spec.MaxSharedServices
+	c.usageOK = spec.UsageRecords
 	// プランが確定した結果、選択済みのポートが上限を超えている場合は先頭から上限までに切り詰める
 	// （Candidates と同じ決定的な順序で残すため、超過分の切り捨ても決定的になる）。
 	if len(c.ports) > c.maxPorts {
@@ -118,8 +123,9 @@ func (c *shareController) bind(sess shareSession) {
 func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd = nil, netip.Addr{}, "", nil, "", nil, nil, nil
+	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd, c.tun = nil, netip.Addr{}, "", nil, "", nil, nil, nil, nil
 	c.maxPorts = plan.MustLookup(plan.Free).MaxSharedServices
+	c.usageOK = plan.MustLookup(plan.Free).UsageRecords
 }
 
 // setPorts は共有するポート集合を設定し、名前配布と表示へ反映する。共有の実行はホストの明示的な
@@ -139,6 +145,21 @@ func (c *shareController) setPorts(ports []int) error {
 	c.mu.Unlock()
 	c.publish()
 	return nil
+}
+
+// usageRecords は共有サービスの利用記録（要件 §4.7）を返す。閲覧できないプラン、または
+// 記録器が無い（-tunnel 無効）場合は ok=false。
+//
+// 計上はプランに関わらずホスト側クライアントで行い（設計原則2 によりサーバーでは計上できない）、
+// 閲覧の可否だけをプランで分ける。
+func (c *shareController) usageRecords() ([]usage.Record, bool) {
+	c.mu.Lock()
+	visible, tunl := c.usageOK, c.tun
+	c.mu.Unlock()
+	if !visible || tunl == nil {
+		return nil, false
+	}
+	return tunl.Usage().Snapshot(), true
 }
 
 // setEndpoint は STUN で発見した WAN エンドポイントを記録する。共有内容の変更を peer_info で
@@ -172,7 +193,7 @@ func (c *shareController) advert() ([]string, []signaling.SharedService) {
 // 何もしない（bind 時に改めて反映される）。
 func (c *shareController) publish() {
 	c.mu.Lock()
-	addr, zone, store, client, pubKey, endpoint, fwd := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd
+	addr, zone, store, client, pubKey, endpoint, fwd, tunl := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd, c.tun
 	c.mu.Unlock()
 	if !addr.IsValid() {
 		return
@@ -186,6 +207,10 @@ func (c *shareController) publish() {
 		ports = append(ports, sv.Port)
 	}
 	fwd.apply(ports)
+	// 到達制御へも同じ集合を反映する。選ばれていないポートへの新規接続はここで落ちる（D-11）。
+	if tunl != nil {
+		tunl.SetSharedPorts(addr, ports)
+	}
 	if zone != nil {
 		// 自身の名前も自分のゾーンへ入れる（ホストの画面に出す URL をホスト自身でも検証できる）。
 		if err := zone.Replace(addr, names); err != nil {

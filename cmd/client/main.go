@@ -79,6 +79,7 @@ func main() {
 	cognitoClientID := flag.String("cognito-client-id", "1mhe007gbarnh3u2f0dkglm8ep", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）。既定は公開サーバーのアプリクライアント")
 	cognitoScope := flag.String("cognito-scope", "openid", "要求スコープ（カンマ区切り）")
 	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	shareGuard := flag.Bool("share-guard", true, "共有していないサービスへのメッシュ越しの到達を遮断する（要 -tunnel）。ICMP と名前解決は常に通す。切り分け用に無効化できる")
 	useDNS := flag.Bool("dns", true, "共有サービスへ名前で到達できるようにする（.mesh のローカル解決＋OS への split DNS 注入。要 -tunnel・管理者権限）")
 	flag.Parse()
 
@@ -104,13 +105,14 @@ func main() {
 			server: *server, account: *account, durationSec: *duration,
 			auto: *auto, useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr,
 			relay: *relay, stdinConsole: true, cognito: cognito,
-			meshName: *meshName, useDNS: *useDNS,
+			meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
 		}
 		err = runHost(ctx, cfg, newViewStore(), nil)
 	case "guest":
 		cfg := guestConfig{
 			inviteURL: *inviteURL, nick: *nick, useTunnel: *useTunnel,
 			ifname: *ifname, stunAddr: *stunAddr, relay: *relay, useDNS: *useDNS,
+			shareGuard: *shareGuard,
 		}
 		err = runGuest(ctx, cfg, newViewStore(), nil)
 	case "gui":
@@ -118,7 +120,7 @@ func main() {
 		opts := guiOptions{
 			server: *server, account: *account, duration: *duration,
 			useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr, relay: *relay,
-			cognito: cognito, meshName: *meshName, useDNS: *useDNS,
+			cognito: cognito, meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
 		}
 		err = runGUI(ctx, *guiAddr, opts)
 	default:
@@ -164,6 +166,7 @@ type hostConfig struct {
 	guiCloseAuthTab  bool          // GUI をアプリ内ウィンドウ（WebView）表示するモードで真。サインイン成功後に認証タブを閉じるよう促す（ルーム情報はウィンドウ側に出るため）
 	meshName         string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
 	useDNS           bool          // 共有サービスの名前解決（ローカルレスポンダ＋split DNS）を有効にする
+	shareGuard       bool          // 共有していない宛先への到達を落とす（付録C.9 D-11）
 	// share は共有状態（どのローカルサービスを貸すか）。GUI が操作するため呼び出し側が生成して
 	// 渡す。nil ならヘッドレス運用とみなし runHost が meshName から生成する（共有なしで開始）。
 	share *shareController
@@ -183,7 +186,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	}
 	// 秘密鍵はメモリロック（可能なら）＋使用後ゼロ化できるバッファで保持する。
 	sk := newSecret(priv)
-	tun, err := openTunnel(cfg.useTunnel, cfg.ifname, sk)
+	tun, err := openTunnel(cfg.useTunnel, cfg.ifname, sk, cfg.shareGuard)
 	// 秘密鍵は wireguard-go デバイスへ適用済み。自コピーは以後不要なので即ゼロ化する。
 	sk.Wipe()
 	if err != nil {
@@ -275,7 +278,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 				}
 			}
 			share.bind(shareSession{
-				zone: zone, store: store, client: c, fwd: fwd,
+				zone: zone, store: store, client: c, fwd: fwd, tun: tun,
 				pubKey: pub, hostIP: rc.HostIP, tier: rc.Tier,
 			})
 		case signaling.TypeJoinPending:
@@ -372,6 +375,7 @@ type guestConfig struct {
 	ifname, stunAddr string
 	relay            bool
 	useDNS           bool // ホストが広告した名前で共有サービスへ到達できるようにする
+	shareGuard       bool // 自分宛の新規接続を落とす（借りる側の端末を開かせない・付録C.9 D-11）
 }
 
 // runGuest はゲストとして招待リンクから参加を申請し、承認・ピア構成を処理する。
@@ -396,7 +400,7 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 	}
 	// 秘密鍵はメモリロック（可能なら）＋使用後ゼロ化できるバッファで保持する。
 	sk := newSecret(priv)
-	tun, err := openTunnel(cfg.useTunnel, cfg.ifname, sk)
+	tun, err := openTunnel(cfg.useTunnel, cfg.ifname, sk, cfg.shareGuard)
 	// 秘密鍵は wireguard-go デバイスへ適用済み。自コピーは以後不要なので即ゼロ化する。
 	sk.Wipe()
 	if err != nil {
@@ -457,6 +461,14 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			// 自身のメッシュIP が確定したのでローカル DNS レスポンダと split DNS を起動する
 			// （ホストの名前は続く peer_info で届く）。
 			nameRes = startNameResolution(ctx, cfg.useDNS && tun != nil, cfg.ifname, ja.AssignedIP, zone)
+			// ゲストは何も貸さないため、自分宛の新規接続はすべて落とす（ICMP と名前解決の
+			// :53 は通る）。借りる側の端末がメッシュ越しに開かれないようにするための既定
+			// （付録C.9 D-11）。
+			if tun != nil {
+				if addr, perr := netip.ParseAddr(ja.AssignedIP); perr == nil {
+					tun.SetSharedPorts(addr, nil)
+				}
+			}
 			advertise(c, tun, cfg.stunAddr, pub, nil) // ホストへ自エンドポイントを広告（ゲストは名前を配らない）
 		case signaling.TypeJoinRejected:
 			var jr signaling.JoinRejected
@@ -501,11 +513,11 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 // openTunnel は -tunnel 有効時に wireguard-go 仮想NICを起動して返す（無効時は nil）。
 // 秘密鍵はゼロ化・メモリロック可能な secret.Value で受け取り、生バイトのまま UAPI へ渡す
 // （base64 文字列として materialize しない）。
-func openTunnel(enabled bool, ifname string, priv *secret.Value) (*Tunnel, error) {
+func openTunnel(enabled bool, ifname string, priv *secret.Value, shareGuard bool) (*Tunnel, error) {
 	if !enabled {
 		return nil, nil
 	}
-	t, err := OpenTunnel(ifname, wgconf.Config{PrivateKeyRaw: priv.Bytes()})
+	t, err := OpenTunnel(ifname, wgconf.Config{PrivateKeyRaw: priv.Bytes()}, shareGuard)
 	if err != nil {
 		return nil, fmt.Errorf("仮想NIC起動: %w", err)
 	}

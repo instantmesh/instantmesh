@@ -99,14 +99,14 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 1. **名前解決（主・実装済み）** `http://ollama.tanaka.mesh:11434` … **権威はホスト、解決はローカル**。ホストが定義した名前⇄メッシュIPの写像を既存シグナリング（`pkg/signaling` の `PeerInfo.Names`/`Services`）で配布し、各クライアントが自プロセス内に持つレスポンダ（`cmd/client/meshdns.go`・自メッシュIP の `:53`）で即答する。名前空間と写像は `pkg/meshname`（`Zone`）、DNS メッセージの解析/応答組み立ては `pkg/dnsmsg`（`pkg/stun` と同じくソケットは持たない）。OS へは split DNS で当該サフィックスのみ注入（`cmd/client/dnsconfig_<os>.go`: Windows=NRPT／macOS=`/etc/resolver/`／Linux=systemd-resolved）。**`hosts` 書き換えとホスト側DNSサーバー方式は採用しない**（要件 付録C.4）。どのサービスを貸すかは `cmd/client/sharing.go` の `shareController`（GUI の `POST /api/share`）が持つ。
 2. **メッシュIP直接** `http://10.0.0.1:11434` … 既存の到達性。削らない。
 
-> **前提（付録C.9 D-10・実装済み）**: `127.0.0.1` バインドのサービスにはメッシュIP 宛のパケットが届かないため、上記 (1)(2) はホスト側のユーザ空間転送（メッシュIP:ポート → `localhost`:ポート・`cmd/client/svcforward.go`）が無いと成立しない。OS の DNAT は使わない。**共有の選択が到達制御になるのは D-11（`tun.Device` を包んだ宛先ポート検査）を入れてから**で、現状は広告のみである点に注意する。
+> **前提（付録C.9 D-10・実装済み）**: `127.0.0.1` バインドのサービスにはメッシュIP 宛のパケットが届かないため、上記 (1)(2) はホスト側のユーザ空間転送（メッシュIP:ポート → `localhost`:ポート・`cmd/client/svcforward.go`）が無いと成立しない。OS の DNAT は使わない。共有の選択は D-11（`cmd/client/tunfilter.go` が `tun.Device` を包み、共有していない宛先への**新規接続**を落とす）により到達制御として効く。ICMP と自メッシュIP の `:53` は常に通す。同じ地点でゲスト別・共有別の通信量を計上する（`pkg/usage`・閲覧は Pro 限定）。切り分け用の無効化は `-share-guard=false`。
 3. **loopback プロキシ（副）** `http://127.0.0.1:11434` … OS の DNS を触れない環境向けの代替。**TCP のみ**。衝突時の代替ポートは決定的に導出する（ランダム割当は不可）。
 
 実装時の必須事項: split DNS の**起動時残骸回収**（実装済み: `cleanupStaleSplitDNS`）、当該サフィックス**以外のクエリ経路を変更しない**スコープ厳守、プロキシの**即時解放**（ホストが元ポートを占有し続けるとゲストが自分の同種サービスを起動できない）、ホスト側サービスに `0.0.0.0` バインドを要求しないこと。名前は自己申告であり、信頼の根拠は SAS による公開鍵の帯域外照合であること（UI にも明示する）。
 
 ### GUI（クライアントの LocalAPI 層）
 
-クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択）。
+クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET /api/usage` は利用記録＝Pro 限定）。
 
 - **UI とコアの分離**: GUI とヘッドレス CLI（`-mode host`/`guest`）は同一の受信ループ（`runHost`/`runGuest`）を駆動する。表示状態は `pkg/appstate`（ゴルーチンセーフなビューモデル）に集約し、GUI・CLI とも購読する（設計原則1）。
 - **セキュリティ**: `/api/*` は `pkg/originguard` で同一オリジン以外（CSRF・DNS リバインディング）を fail-closed で 403。127.0.0.1 のみに bind し、WireGuard 秘密鍵などの復号鍵は API に一切載せない（配信は公開鍵・招待・表示メタデータのみ）。

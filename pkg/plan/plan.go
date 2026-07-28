@@ -58,6 +58,10 @@ type Spec struct {
 	// 課金軸は既に「量」から「統制」へ移しているため（付録C の D-4）ここは体験を殺さない値に
 	// 置く。無料でも複数（例: Dify ＋ ローカルLLM）を同時に貸せることを優先する（D-15）。
 	MaxSharedServices int
+
+	// UsageRecords は共有単位・ゲスト単位の利用記録を閲覧できるか（要件 §4.7・§5）。
+	// 計上自体はプランに関わらずホスト側クライアントで行い、閲覧の可否だけをここで分ける。
+	UsageRecords bool
 }
 
 var specs = map[Tier]Spec{
@@ -68,6 +72,7 @@ var specs = map[Tier]Spec{
 		RelayByteLimit:    relayFreeByteLimit,
 		RelayThrottledBps: relayThrottleBps,
 		MaxSharedServices: 3,
+		UsageRecords:      false,
 	},
 	Pro: {
 		Tier:              Pro,
@@ -76,6 +81,7 @@ var specs = map[Tier]Spec{
 		RelayByteLimit:    0, // 制限緩和
 		RelayThrottledBps: 0,
 		MaxSharedServices: 10,
+		UsageRecords:      true,
 	},
 }
 

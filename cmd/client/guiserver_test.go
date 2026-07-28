@@ -18,6 +18,7 @@ import (
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
+	"github.com/instantmesh/instantmesh/pkg/usage"
 )
 
 // fakeConn は signalclient.Conn を満たすテスト用接続。送出メッセージを記録し、
@@ -107,7 +108,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 		{"POST", "/api/host"}, {"POST", "/api/join"}, {"POST", "/api/approve"},
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
 		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
-		{"GET", "/api/services"}, {"POST", "/api/share"},
+		{"GET", "/api/services"}, {"POST", "/api/share"}, {"GET", "/api/usage"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -625,5 +626,30 @@ func TestGUIServerShare(t *testing.T) {
 	}
 	if _, svcs := gs.share.advert(); len(svcs) != 0 {
 		t.Errorf("共有を停止できていない: %+v", svcs)
+	}
+}
+
+// TestGUIServerUsage は利用記録の閲覧が有料プラン限定（§5）であることを確かめる。
+func TestGUIServerUsage(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	// 無料プラン（既定）では available=false。
+	rec := do(t, gs, "GET", "/api/usage", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var body struct {
+		Available bool           `json:"available"`
+		Records   []usage.Record `json:"records"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Available {
+		t.Error("無料プランで利用記録を閲覧可能にしている")
+	}
+	if body.Records == nil {
+		t.Error("records は空配列であるべき（null 不可）")
 	}
 }
