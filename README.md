@@ -212,7 +212,8 @@ instant-mesh/
     ├── signaling / session / hub / cognitojwt / auditlog  # 制御プレーン（メッセージスキーマ・純粋ディスパッチャ・接続配線・Cognito JWT 検証・監査ログのバッチ/シリアライズ）
     ├── relay / relayhub / relayframe               # データプレーン（リレー中継・通信量メータ/スロットル・ワイヤフレーム）
     ├── stun / stunmux / wgstat / connmon           # NATトラバーサル（STUN・WGソケット相乗り・直通成否検知・直通⇄リレー状態機械）
-    └── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
+    ├── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / appstate / originguard / oauthpkce  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可）
+    └── localsvc                                    # 共有層（ローカルサービスの既知ポート表・共有候補の組み立て）
 ```
 
 各パッケージの役割と進捗は [`TODO.md`](TODO.md) を参照。テストカバレッジは CI（GitHub Actions）の `go test ./... -cover` で確認でき、純粋ロジック（`pkg/`）は全パッケージ 100% カバレッジを維持しています。

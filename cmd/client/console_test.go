@@ -113,7 +113,7 @@ func hostingStore(t *testing.T, guests ...appstate.GuestView) *viewStore {
 		if err := m.StartHosting(); err != nil {
 			t.Fatalf("StartHosting: %v", err)
 		}
-		if err := m.RoomCreated("room1", "invite-link", "SAS0"); err != nil {
+		if err := m.RoomCreated("room1", "invite-link", "SAS0", "10.0.0.1"); err != nil {
 			t.Fatalf("RoomCreated: %v", err)
 		}
 		for _, g := range guests {

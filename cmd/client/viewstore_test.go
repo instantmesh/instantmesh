@@ -18,7 +18,7 @@ func TestViewStoreUpdateSnapshot(t *testing.T) {
 	// update で遷移を適用すると snapshot に反映される。
 	s.update(func(m *appstate.Model) {
 		_ = m.StartHosting()
-		_ = m.RoomCreated("room-1", "instantmesh://join?x=1", "AB-CD-EF")
+		_ = m.RoomCreated("room-1", "instantmesh://join?x=1", "AB-CD-EF", "10.0.0.1")
 	})
 	snap := s.snapshot()
 	if snap.Phase != "hosting" || snap.Role != "host" {
@@ -33,7 +33,7 @@ func TestViewStoreGuestIP(t *testing.T) {
 	s := newViewStore()
 	s.update(func(m *appstate.Model) {
 		_ = m.StartHosting()
-		_ = m.RoomCreated("room-1", "link", "sas")
+		_ = m.RoomCreated("room-1", "link", "sas", "10.0.0.1")
 		_ = m.AddPending("guest-pub", "alice", "GG-HH")
 	})
 
@@ -81,7 +81,7 @@ func TestViewStoreConcurrent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			s.update(func(m *appstate.Model) { _ = m.RoomCreated("r", "l", "s") })
+			s.update(func(m *appstate.Model) { _ = m.RoomCreated("r", "l", "s", "10.0.0.1") })
 		}
 	}()
 	go func() {

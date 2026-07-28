@@ -231,7 +231,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			_ = env.Unmarshal(&rc)
 			inv := invite.Invite{Server: cfg.server, Token: rc.Token, HostPubKey: pub}
 			link, _ := inv.URL()
-			store.update(func(m *appstate.Model) { _ = m.RoomCreated(rc.RoomID, link, inv.SAS()) })
+			store.update(func(m *appstate.Model) { _ = m.RoomCreated(rc.RoomID, link, inv.SAS(), rc.HostIP) })
 			slog.Info("ルーム作成", "room_id", rc.RoomID, "host_ip", rc.HostIP)
 			fmt.Println("招待リンク:", link)
 			fmt.Println("SAS:", inv.SAS())

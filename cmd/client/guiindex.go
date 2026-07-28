@@ -60,6 +60,11 @@ var app = document.getElementById('app');
 var conn = document.getElementById('conn');
 var errBox = document.getElementById('err');
 var lastSig = '';
+var lastSnap = null;
+// ローカルサービス検出（要件 §4.6.1）の結果。null = 未取得。/api/state のポーリングとは別に、
+// ホスト画面に入ったとき一度だけ取得し、以後は「再検出」ボタンでのみ更新する（毎秒の走査を避ける）。
+var services = null;
+var servicesLoading = false;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -103,6 +108,41 @@ function idleHTML() {
     '</section>';
 }
 
+async function loadServices() {
+  if (servicesLoading) return;
+  servicesLoading = true;
+  try {
+    var res = await fetch('/api/services');
+    services = (await res.json()).services || [];
+  } catch (e) {
+    services = [];
+  }
+  servicesLoading = false;
+  if (lastSnap) render(lastSnap);
+}
+
+// servicesSection はホスト側で検出したローカルサービスを一覧提示する（要件 §4.6.1）。
+// 現時点で提示できる到達手段はメッシュIP直接（§4.6.2 経路(2)）のみ。安定名（経路(1)）と
+// loopback プロキシ（経路(3)）は未実装であり、ここでは約束しない。
+function servicesSection(s) {
+  if (services === null) {
+    return '<section class="card"><h2>ローカルサービス</h2><p class="muted">検出中…</p></section>';
+  }
+  var body = services.length
+    ? '<ul>' + services.map(function(v) {
+        var url = 'http://' + (s.hostIp || '') + ':' + v.port;
+        return '<li class="row"><div><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span>' +
+          '<br><code>' + esc(url) + '</code></div>' +
+          '<div class="actions"><button data-copy="' + esc(url) + '">URLをコピー</button></div></li>';
+      }).join('') + '</ul>'
+    : '<p class="muted">起動中のローカルサービスは見つかりませんでした。</p>';
+  return '<section class="card"><h2>ローカルサービス（' + services.length + '）</h2>' +
+    '<p class="muted">承認済みのゲストだけが、このメッシュIP付きURLで到達できます。' +
+    '検出はループバックへの TCP 接続確認のみで、サービスへ要求は送っていません。</p>' +
+    body +
+    '<div class="actions"><button id="btn-rescan">再検出</button></div></section>';
+}
+
 function peersSection(s) {
   var body = s.peers.length
     ? '<ul>' + s.peers.map(function(p) {
@@ -136,6 +176,7 @@ function hostingHTML(s) {
       '<div class="qr"><img alt="招待QR" src="/api/qr?l=' + encodeURIComponent(s.inviteLink) + '"></div>' +
       '<p class="muted">SAS（ホスト鍵。ゲストへ帯域外で伝え、読み合わせて MITM を防ぐ）</p><code class="sas">' + esc(s.sas) + '</code>' +
     '</section>' +
+    servicesSection(s) +
     '<section class="card"><h2>待合室（' + pending.length + '）</h2>' + pendingBody + '</section>' +
     '<section class="card"><h2>参加者（' + approved.length + '）</h2>' + approvedBody + '</section>' +
     peersSection(s);
@@ -194,6 +235,14 @@ function wire(s) {
   if (lv) lv.onclick = function() { post('/api/leave'); };
   var rs = document.getElementById('btn-restart');
   if (rs) rs.onclick = function() { post('/api/reset'); };
+  var rc = document.getElementById('btn-rescan');
+  if (rc) rc.onclick = function() { loadServices(); };
+  var cus = document.querySelectorAll('[data-copy]');
+  for (var n = 0; n < cus.length; n++) (function(b) {
+    b.onclick = function() {
+      if (navigator.clipboard) navigator.clipboard.writeText(b.getAttribute('data-copy'));
+    };
+  })(cus[n]);
   var els = document.querySelectorAll('[data-approve]');
   for (var i = 0; i < els.length; i++) (function(b) { b.onclick = function() { post('/api/approve', {pubKey: b.getAttribute('data-approve')}); }; })(els[i]);
   els = document.querySelectorAll('[data-reject]');
@@ -201,10 +250,15 @@ function wire(s) {
 }
 
 function render(s) {
+  lastSnap = s;
   conn.textContent = s.role !== 'none' ? ('役割: ' + s.role + ' / ' + s.phase) : '';
   if (s.error) { errBox.hidden = false; errBox.textContent = 'エラー: ' + s.error; } else { errBox.hidden = true; }
+  // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
+  if (s.phase === 'hosting' && services === null) loadServices();
+  // ホストを離れたら結果を捨て、次にホストになったとき再走査させる。
+  if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s);
+  var sig = JSON.stringify(s) + '|' + JSON.stringify(services);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);

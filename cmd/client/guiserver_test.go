@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
 )
@@ -105,6 +107,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 		{"POST", "/api/host"}, {"POST", "/api/join"}, {"POST", "/api/approve"},
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
 		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
+		{"GET", "/api/services"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -169,7 +172,7 @@ func TestGUIServerQR(t *testing.T) {
 	// 招待リンクを設定すると SVG を返す。
 	gs.store.update(func(m *appstate.Model) {
 		_ = m.StartHosting()
-		_ = m.RoomCreated("room-1", "instantmesh://join?server=ws%3A%2F%2Fx%2Fws&token=t&host=h", "SAS")
+		_ = m.RoomCreated("room-1", "instantmesh://join?server=ws%3A%2F%2Fx%2Fws&token=t&host=h", "SAS", "10.0.0.1")
 	})
 	rec := do(t, gs, "GET", "/api/qr", "")
 	if rec.Code != http.StatusOK {
@@ -180,6 +183,48 @@ func TestGUIServerQR(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "<svg") {
 		t.Error("QR レスポンスに <svg が含まれない")
+	}
+}
+
+func TestGUIServerServices(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	// 11434 のみ待受している状態を模す。
+	f := newFakeDial("127.0.0.1:11434")
+	gs.probeDial = f.dial
+
+	rec := do(t, gs, "GET", "/api/services", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type=%q, want json", ct)
+	}
+	var body struct {
+		Services []localsvc.Candidate `json:"services"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := []localsvc.Candidate{{Port: 11434, Label: "Ollama", Detected: true}}
+	if !reflect.DeepEqual(body.Services, want) {
+		t.Errorf("services = %+v, want %+v", body.Services, want)
+	}
+}
+
+func TestGUIServerServicesNoneDetected(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+	gs.probeDial = newFakeDial().dial
+
+	rec := do(t, gs, "GET", "/api/services", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	// 検出ゼロでも空配列を返す（フロントが null 分岐を持たなくて済むように）。
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"services":[]}` {
+		t.Errorf("body = %s, want {\"services\":[]}", got)
 	}
 }
 
@@ -194,7 +239,7 @@ func TestGUIServerHostStart(t *testing.T) {
 		onClient(signalclient.New(fc))
 		store.update(func(m *appstate.Model) {
 			_ = m.StartHosting()
-			_ = m.RoomCreated("room-1", "link", "SAS")
+			_ = m.RoomCreated("room-1", "link", "SAS", "10.0.0.1")
 		})
 		<-ctx.Done()
 		return nil
@@ -293,7 +338,7 @@ func startFakeHost(t *testing.T, gs *guiServer) *fakeConn {
 		onClient(signalclient.New(fc))
 		store.update(func(m *appstate.Model) {
 			_ = m.StartHosting()
-			_ = m.RoomCreated("room-1", "link", "SAS")
+			_ = m.RoomCreated("room-1", "link", "SAS", "10.0.0.1")
 			_ = m.AddPending("guest-pub", "alice", "GG-HH")
 		})
 		<-ctx.Done()
