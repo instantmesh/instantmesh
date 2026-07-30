@@ -10,6 +10,8 @@ InstantMesh は、**手元のローカルAI（ローカルLLM／MCP サーバー
 
 **このマシンにはローカル Go がある**（`C:\Program Files\Go`・`go version` で確認）。`go build` / `go vet` / `go test` / `go mod tidy` はローカルで実行でき、変更の**高速な事前確認**に使ってよい。ただし**合否判定は CI（GitHub Actions）が正**：`pkg/` 100% カバレッジ強制・`govulncheck`・クロスビルドなどは CI が最終判断する。コードを変更したら push して CI の結果を `gh run list` / `gh run view` で確認するのが引き続き標準フロー（ローカルの成功だけで「通った」と判断しない）。
 
+> **`go test -race` はこのマシンでは実行できない**（C コンパイラが無く `-race requires cgo` / `cgo: C compiler "gcc" not found` で失敗する）。したがって**データ競合を検出できるのは CI だけ**で、ローカルの `go test` 成功はその保証を含まない。並行処理（ゴルーチン間で共有する変数・テスト内のクロージャを含む）に触れた変更は、push して CI の `Test (race + coverage)` を通るまで完了とみなさない。
+
 > 注: 他の開発者や CI ランナーの環境には Go が無い前提の記述が本ドキュメントに残っている場合がある。ローカル実行はこのマシン固有の補助手段であり、CI 中心のワークフローが正であることは変わらない。
 
 CI（`.github/workflows/ci.yml`）が push/PR ごとに実行する内容（ローカルで再現する場合も同じコマンド）:

@@ -199,9 +199,13 @@ func TestLoopbackRelaysToHost(t *testing.T) {
 	// dial をフェイクにして実サービスへ繋ぐ（宛先文字列が正しいことも確かめる）。
 	p := newLoopbackProxy(ctx, testHostKey, netip.MustParseAddr("10.9.0.1"))
 	wantTarget := "10.9.0.1:" + portStr
-	var gotTarget string
+	// 転送先はフォワーダのゴルーチンが決めるため、チャネルで受け取る（テスト側と同期する）。
+	targets := make(chan string, 1)
 	p.dial = func(network, addr string) (net.Conn, error) {
-		gotTarget = addr
+		select {
+		case targets <- addr:
+		default:
+		}
 		return net.Dial(network, svc.Addr().String())
 	}
 	p.listen = func(port int) (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") }
@@ -230,8 +234,13 @@ func TestLoopbackRelaysToHost(t *testing.T) {
 	if string(buf) != "hi\n" {
 		t.Errorf("受信 = %q, want %q", buf, "hi\n")
 	}
-	if gotTarget != wantTarget {
-		t.Errorf("転送先 = %q, want %q", gotTarget, wantTarget)
+	select {
+	case gotTarget := <-targets:
+		if gotTarget != wantTarget {
+			t.Errorf("転送先 = %q, want %q", gotTarget, wantTarget)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("転送先へのダイヤルが行われなかった")
 	}
 }
 
