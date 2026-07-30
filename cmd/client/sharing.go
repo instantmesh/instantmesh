@@ -219,6 +219,34 @@ func (c *shareController) storePorts(ports []int) error {
 	return nil
 }
 
+// shareSnapshot は publish が 1 回のロックで取り出す状態一式。取得と適用を分ける以上、
+// 適用に使う値は同じ瞬間のものでなければならない（ラベルと選択が別の瞬間の組み合わせになると、
+// 配る名前と開く待受が食い違う）。
+type shareSnapshot struct {
+	addr     netip.Addr
+	zone     *meshname.Zone
+	store    *viewStore
+	client   *signalclient.Client
+	pubKey   string
+	endpoint string
+	fwd      *serviceForwarder
+	tun      *Tunnel
+	gate     *l7Gate
+	names    []string
+	svcs     []signaling.SharedService
+}
+
+// snapshotLocked は現在の状態と、そこから組み立てた広告を返す（呼び出し側でロック済みであること）。
+func (c *shareController) snapshotLocked() shareSnapshot {
+	s := shareSnapshot{
+		addr: c.addr, zone: c.zone, store: c.store, client: c.client,
+		pubKey: c.pubKey, endpoint: c.endpoint, fwd: c.fwd, tun: c.tun,
+		gate: c.gateLocked(),
+	}
+	s.names, s.svcs = c.advertLocked()
+	return s
+}
+
 // setLabel はメッシュ名に使うホストラベルを変更する（GUI の「名前を保存」・付録C.9 D-14）。
 // 入力は meshname.Sanitize で LDH ラベルへ落とすため "Tanaka Note" → "tanaka-note" のように
 // 受け付けるが、ラベルとして成立しない入力（英数字を含まない等）は errInvalidMeshLabel で拒む。
@@ -296,13 +324,18 @@ func (c *shareController) setEndpoint(ep string) {
 // 空を返し、広告なしの peer_info（従来どおりのエンドポイント交換）に落とす。
 func (c *shareController) advert() ([]string, []signaling.SharedService) {
 	c.mu.Lock()
-	label, ports := c.label, append([]int(nil), c.ports...)
+	defer c.mu.Unlock()
+	return c.advertLocked()
+}
+
+// advertLocked は広告を組み立てる（呼び出し側でロック済みであること）。
+func (c *shareController) advertLocked() ([]string, []signaling.SharedService) {
+	label, ports := c.label, c.ports
 	// プラン上限を超える選択は先頭から上限までを貸す（順序は Candidates と同じ規則で決まるため
 	// 超過分の切り捨ても決定的）。選択自体は減らさない（bind のコメント参照）。
 	if len(ports) > c.maxPorts {
 		ports = ports[:c.maxPorts]
 	}
-	c.mu.Unlock()
 
 	names, shared, err := localsvc.Advertise(label, ports)
 	if err != nil {
@@ -325,53 +358,51 @@ func (c *shareController) publish() {
 	c.pubMu.Lock()
 	defer c.pubMu.Unlock()
 	c.mu.Lock()
-	addr, zone, store, client, pubKey, endpoint, fwd, tunl := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd, c.tun
-	gate := c.gateLocked()
+	s := c.snapshotLocked()
 	c.mu.Unlock()
-	if !addr.IsValid() {
+	if !s.addr.IsValid() {
 		return
 	}
 
-	names, svcs := c.advert()
 	// 共有中サービスへの転送を差分適用する。127.0.0.1 バインドのサービスへゲストが到達できる
 	// ようにするための必須部品で（付録C.9 D-10）、共有から外れたポートは直ちに解放される。
-	ports := make([]int, 0, len(svcs))
-	for _, sv := range svcs {
+	ports := make([]int, 0, len(s.svcs))
+	for _, sv := range s.svcs {
 		ports = append(ports, sv.Port)
 	}
-	fwd.setGate(gate)
-	fwd.apply(ports)
+	s.fwd.setGate(s.gate)
+	s.fwd.apply(ports)
 	// 到達制御へも同じ集合を反映する。選ばれていないポートへの新規接続はここで落ちる（D-11）。
-	if tunl != nil {
-		tunl.SetSharedPorts(addr, ports)
+	if s.tun != nil {
+		s.tun.SetSharedPorts(s.addr, ports)
 	}
-	if zone != nil {
+	if s.zone != nil {
 		// 自身の名前も自分のゾーンへ入れる（ホストの画面に出す URL をホスト自身でも検証できる）。
-		if err := zone.Replace(addr, names); err != nil {
+		if err := s.zone.Replace(s.addr, s.names); err != nil {
 			slog.Warn("メッシュ名の登録に失敗しました", "err", err)
 		}
 	}
-	if store != nil {
-		list := make([]appstate.SharedService, 0, len(svcs))
-		for _, s := range svcs {
-			label, _ := localsvc.LabelFor(s.Port)
-			list = append(list, appstate.SharedService{Port: s.Port, Label: label, Name: s.Name, Addr: addr.String()})
+	if s.store != nil {
+		list := make([]appstate.SharedService, 0, len(s.svcs))
+		for _, sv := range s.svcs {
+			label, _ := localsvc.LabelFor(sv.Port)
+			list = append(list, appstate.SharedService{Port: sv.Port, Label: label, Name: sv.Name, Addr: s.addr.String()})
 		}
 		hostName := ""
-		if len(names) > 0 {
-			hostName = names[0] // Advertise の先頭はホスト自身の名前
+		if len(s.names) > 0 {
+			hostName = s.names[0] // Advertise の先頭はホスト自身の名前
 		}
-		store.update(func(m *appstate.Model) {
+		s.store.update(func(m *appstate.Model) {
 			m.SetMeshName(hostName)
 			_ = m.SetShared(list)
 		})
 	}
 	// 承認済みゲストへ再広告する。WAN エンドポイントが未確定（STUN 無効 / 未実行）の場合は
 	// peer_info を組めないため送らない。次にエンドポイントが確定した広告時に相乗りする。
-	if client == nil || endpoint == "" {
+	if s.client == nil || s.endpoint == "" {
 		return
 	}
-	if err := client.SendPeerInfo(pubKey, endpoint, names, svcs); err != nil {
+	if err := s.client.SendPeerInfo(s.pubKey, s.endpoint, s.names, s.svcs); err != nil {
 		slog.Warn("共有内容の再広告に失敗しました", "err", err)
 	}
 }

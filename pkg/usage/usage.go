@@ -74,9 +74,20 @@ func (r *Recorder) AddOut(peer netip.Addr, port uint16, n int, now time.Time) {
 	r.add(Key{Peer: peer, Port: port}, 0, int64(n), 0, now)
 }
 
-// AddRequest はリクエスト 1 件を計上する（L7 ゲートを通る共有サービスのみ）。
-func (r *Recorder) AddRequest(peer netip.Addr, port uint16, now time.Time) {
-	r.add(Key{Peer: peer, Port: port}, 0, 0, 1, now)
+// AllowRequest はゲストが上限に達していなければリクエスト 1 件を計上して true を返す
+// （L7 ゲートを通る共有サービスのみ）。上限に達していれば計上せず false を返す。
+//
+// 判定と計上を 1 つの臨界区間で行うのは、境界での取りこぼしを防ぐため —— 別々に呼ぶと、
+// 上限直前の同時要求が両方とも判定を通過して上限を超えて計上されうる。ロックの往復も 1 回で済む
+// （同じロックはデータパスがパケットごとに取るため、保持回数を増やしたくない）。
+func (r *Recorder) AllowRequest(peer netip.Addr, port uint16, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.exceededLocked(peer) {
+		return false
+	}
+	r.addLocked(Key{Peer: peer, Port: port}, 0, 0, 1, now)
+	return true
 }
 
 // SetLimit はゲスト単位の上限を設定する（ゼロ値の Limit で解除）。
@@ -108,11 +119,13 @@ func (r *Recorder) HasLimits() bool {
 	return len(r.limits) > 0
 }
 
-// Exceeded はゲストが上限に達しているかを返す。上限未設定なら常に false。
-// 判定に使うのは当該ゲストの全共有サービスの合計。
-func (r *Recorder) Exceeded(peer netip.Addr) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// exceededLocked はゲストが上限に達しているかを返す（呼び出し側でロック済みであること）。
+// 上限未設定なら常に false。判定に使うのは当該ゲストの全共有サービスの合計。
+//
+// 走査は当該ゲストの記録に限られ、件数はゲスト数 × 共有サービス数（いずれもプラン上限あり・§5）で
+// 抑えられている。上限が設定されていないゲストは先頭で抜けるため、統制を使わない運用では走査自体が
+// 起きない。
+func (r *Recorder) exceededLocked(peer netip.Addr) bool {
 	l, ok := r.limits[peer]
 	if !ok {
 		return false
@@ -128,13 +141,18 @@ func (r *Recorder) Exceeded(peer netip.Addr) bool {
 	return (l.MaxBytes > 0 && bytes >= l.MaxBytes) || (l.MaxRequests > 0 && reqs >= l.MaxRequests)
 }
 
-// add は計上単位を解決し、集計値へ加算する（全ての Add* の実体）。
+// add は計上単位を解決し、集計値へ加算する（バイト計上の実体）。
 func (r *Recorder) add(k Key, in, out, reqs int64, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addLocked(k, in, out, reqs, now)
+}
+
+// addLocked は集計値へ加算する（呼び出し側でロック済みであること）。
+func (r *Recorder) addLocked(k Key, in, out, reqs int64, now time.Time) {
 	if !k.Peer.IsValid() || k.Port == 0 {
 		return // 計上単位を特定できないものは記録しない
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	e, ok := r.entries[k]
 	if !ok {
 		e = &entry{firstSeen: now}

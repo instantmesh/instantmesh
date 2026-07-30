@@ -76,11 +76,11 @@ func (g *l7Gate) check(peer netip.Addr, port uint16, header http.Header) verdict
 			return verdict{status: http.StatusUnauthorized, reason: "アクセスキーが必要です"}
 		}
 	}
-	// 上限に達したゲストだけを遮断する（ルーム全体には影響させない・§4.7）。
-	if g.rec.Exceeded(peer) {
+	// 上限に達したゲストだけを遮断する（ルーム全体には影響させない・§4.7）。判定と計上は
+	// AllowRequest が 1 つの臨界区間で行う（境界での取りこぼしを防ぐ）。
+	if !g.rec.AllowRequest(peer, port, g.now()) {
 		return verdict{status: http.StatusTooManyRequests, reason: "利用上限に達しました"}
 	}
-	g.rec.AddRequest(peer, port, g.now())
 	return verdict{}
 }
 

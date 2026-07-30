@@ -83,30 +83,33 @@ func TestRequestsAndLimits(t *testing.T) {
 	alice := netip.MustParseAddr("10.0.0.2")
 	bob := netip.MustParseAddr("10.0.0.3")
 
-	r.AddRequest(alice, 11434, now)
-	r.AddRequest(alice, 11434, now)
+	// 上限未設定なら常に通り、そのつど計上される。
+	for i := 0; i < 2; i++ {
+		if !r.AllowRequest(alice, 11434, now) {
+			t.Fatalf("上限未設定で拒否された（%d 回目）", i+1)
+		}
+	}
 	if got := r.Snapshot()[0].Requests; got != 2 {
 		t.Errorf("Requests = %d, want 2", got)
-	}
-
-	// 上限未設定なら常に超過しない。
-	if r.Exceeded(alice) {
-		t.Error("上限未設定で超過扱いになった")
 	}
 	if r.HasLimits() {
 		t.Error("上限未設定で HasLimits が真になった")
 	}
-	// リクエスト数の上限。
+
+	// リクエスト数の上限。到達後は拒否し、拒否した分は計上しない。
 	r.SetLimit(alice, Limit{MaxRequests: 2})
-	if !r.Exceeded(alice) {
-		t.Error("リクエスト上限に達したのに超過でない")
+	if r.AllowRequest(alice, 11434, now) {
+		t.Error("リクエスト上限に達したのに通った")
+	}
+	if got := r.Snapshot()[0].Requests; got != 2 {
+		t.Errorf("拒否した要求を計上した: Requests = %d, want 2", got)
 	}
 	// 上限が 1 件でもあれば HasLimits は真（呼び出し側が L7 で数える判定に使う）。
 	if !r.HasLimits() {
 		t.Error("上限を設定しても HasLimits が偽")
 	}
-	if r.Exceeded(bob) {
-		t.Error("他のゲストまで超過扱いになった（当該ゲストのみを遮断すべき）")
+	if !r.AllowRequest(bob, 11434, now) {
+		t.Error("他のゲストまで遮断された（当該ゲストのみを遮断すべき）")
 	}
 	if got := r.LimitFor(alice); got.MaxRequests != 2 {
 		t.Errorf("LimitFor = %+v", got)
@@ -115,18 +118,18 @@ func TestRequestsAndLimits(t *testing.T) {
 	// バイト数の上限（送受信の合計で判定）。
 	r.SetLimit(bob, Limit{MaxBytes: 100})
 	r.AddIn(bob, 11434, 60, now)
-	if r.Exceeded(bob) {
-		t.Error("上限未達で超過扱いになった")
+	if !r.AllowRequest(bob, 11434, now) {
+		t.Error("上限未達で遮断された")
 	}
 	r.AddOut(bob, 11434, 40, now)
-	if !r.Exceeded(bob) {
-		t.Error("送受信合計で上限に達したのに超過でない")
+	if r.AllowRequest(bob, 11434, now) {
+		t.Error("送受信合計で上限に達したのに通った")
 	}
 
 	// ゼロ値で解除できる。
 	r.SetLimit(alice, Limit{})
-	if r.Exceeded(alice) {
-		t.Error("上限を解除しても超過のまま")
+	if !r.AllowRequest(alice, 11434, now) {
+		t.Error("上限を解除しても遮断されたまま")
 	}
 
 	// Forget は上限も一緒に消す。

@@ -63,6 +63,9 @@ var conn = document.getElementById('conn');
 var errBox = document.getElementById('err');
 var lastSig = '';
 var lastSnap = null;
+// lastSnapText は lastSnap の JSON 表現（再描画判定のシグネチャに使う）。サーバーから受けた
+// 生のテキストをそのまま持ち、毎秒の再シリアライズを省く。
+var lastSnapText = '';
 // ローカルサービス検出（要件 §4.6.1）の結果。null = 未取得。/api/state のポーリングとは別に、
 // ホスト画面に入ったとき一度だけ取得し、以後は「再検出」ボタンでのみ更新する（毎秒の走査を避ける）。
 var services = null;
@@ -123,9 +126,10 @@ async function getJSON(path) {
   }
 }
 
-// rerender は取得したデータを反映するために最後のスナップショットで描き直す。
+// rerender は取得したデータ（サービス一覧・設定・統制・利用記録）を反映するため、最後の
+// スナップショットで描き直す。表示状態そのものは変わらないので生 JSON も使い回す。
 function rerender() {
-  if (lastSnap) render(lastSnap);
+  if (lastSnap) render(lastSnap, lastSnapText);
 }
 
 function idleHTML() {
@@ -451,8 +455,11 @@ function wire(s) {
   for (var k = 0; k < els.length; k++) (function(b) { b.onclick = function() { post('/api/reject', {pubKey: b.getAttribute('data-reject')}); }; })(els[k]);
 }
 
-function render(s) {
+// render は表示状態を描画する。text はサーバーから受け取った s の生 JSON（あれば）で、
+// 再描画判定のシグネチャに使い回して再シリアライズを省く。
+function render(s, text) {
   lastSnap = s;
+  lastSnapText = text || JSON.stringify(s);
   conn.textContent = s.role !== 'none' ? ('役割: ' + s.role + ' / ' + s.phase) : '';
   if (s.error) { errBox.hidden = false; errBox.textContent = 'エラー: ' + s.error; } else { errBox.hidden = true; }
   // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
@@ -465,7 +472,7 @@ function render(s) {
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
   if (s.phase !== 'hosting') { selected = null; usage = null; control = null; }
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control) + '|' + JSON.stringify(conf);
+  var sig = lastSnapText + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control) + '|' + JSON.stringify(conf);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
@@ -474,8 +481,9 @@ function render(s) {
 
 async function poll() {
   try {
-    var s = await (await fetch('/api/state')).json();
-    render(s);
+    // 生のテキストで受け取り、パースした値と一緒に render へ渡す（再描画判定で使い回す）。
+    var text = await (await fetch('/api/state')).text();
+    render(JSON.parse(text), text);
   } catch (e) { /* 一時的な取得失敗は無視して次のポーリングで回復する */ }
 }
 setInterval(poll, 1000);
