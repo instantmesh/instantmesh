@@ -16,21 +16,26 @@ package main
 //   - 実際の待受ポートは表示状態（pkg/appstate の SharedService.Local）へ載せ、UI がコピー可能な
 //     URL を出せるようにする。
 //   - 共有停止・キック・解散・時間切れで**直ちに解放**する（ホストが元ポートを占有し続けると
-//     ゲストが自分の同種サービスを起動できない）。
-//   - 転送コアはホスト側と同一（svcforward.go の forwarder）。向きと待受アドレスだけを変える。
+//     ゲストが自分の同種サービスを起動できない）。解放と差分適用の器はホスト側の転送と共通
+//     （listenerSet）で、ここが与えるのは「候補列を順に bind 試行する」という開き方だけ。
+//   - 転送コアもホスト側と同一（svcforward.go の forwarder）。向きと待受アドレスだけを変える。
 //
 // 対象は TCP のみ（UDP は名前解決／メッシュIP 直接の経路を使う）。
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
 
+	"github.com/instantmesh/instantmesh/pkg/appstate"
 	"github.com/instantmesh/instantmesh/pkg/portmap"
 )
+
+// errNoLoopbackPort は全候補が埋まっていて待受を確保できなかったことを表す。
+var errNoLoopbackPort = errors.New("loopback: no available port for the shared service")
 
 // startLoopback は enabled のとき loopback プロキシを生成する（無効なら nil を返し、以後の
 // apply / closeAll は no-op）。hostIP を解釈できない場合も無効として扱う。
@@ -48,27 +53,19 @@ func startLoopback(ctx context.Context, enabled bool, hostKey, hostIP string) *l
 }
 
 // loopbackProxy はホストの共有サービスをゲストの `127.0.0.1` へ出す待受群を管理する。
-// ホストの広告を受けるたびに apply で差分適用し、外れたサービスの待受は直ちに閉じる。
+// 待受の集合管理は listenerSet が担い、ここは「どのポートで開くか」の方針だけを持つ。
 type loopbackProxy struct {
 	// hostKey はホストの公開鍵。代替ポートの決定的な導出に使う（同じホストなら毎回同じポート）。
 	hostKey string
+	// hostIP は転送先ホストのメッシュIP。
+	hostIP netip.Addr
 
 	// listen は待受を開く関数（テストでフェイクへ差し替え可能）。既定は 127.0.0.1 への TCP bind。
 	listen func(port int) (net.Listener, error)
 	// dial は転送先（ホストのメッシュIP:ポート）への接続（同上）。
 	dial func(network, addr string) (net.Conn, error)
 
-	mu     sync.Mutex
-	hostIP netip.Addr             // 転送先ホストのメッシュIP（承認後に確定）
-	active map[int]*loopbackEntry // 元ポート → 稼働中の待受
-	closed bool
-}
-
-// loopbackEntry は 1 サービス分の待受と、その写像。
-type loopbackEntry struct {
-	fwd   *forwarder
-	local int  // 実際の待受ポート
-	moved bool // 元ポートから退避したか
+	set *listenerSet
 }
 
 // newLoopbackProxy は指定ホストの共有サービスを loopback へ出すプロキシを返す。
@@ -77,148 +74,81 @@ func newLoopbackProxy(ctx context.Context, hostKey string, hostIP netip.Addr) *l
 	p := &loopbackProxy{
 		hostKey: hostKey,
 		hostIP:  hostIP,
-		listen: func(port int) (net.Listener, error) {
-			// 待受は 127.0.0.1 限定（§4.6.4）。
-			return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		},
-		dial:   net.Dial,
-		active: make(map[int]*loopbackEntry),
+		listen:  listenLoopback,
+		dial:    net.Dial,
 	}
-	go func() {
-		<-ctx.Done()
-		p.closeAll()
-	}()
+	p.set = newListenerSet(ctx, p.open)
 	return p
 }
 
-// apply はホストが広告した共有ポート集合へ待受を合わせ、元ポート → 実待受ポートの写像を返す
-// （p が nil なら nil を返す＝経路無効）。戻り値は表示状態へ載せるためのもので、待受を開けなかった
-// サービスは含まれない。
-//
-// 既に同じ元ポートで稼働している待受は張り替えない（確立済み接続を切らないため）。共有から外れた
-// ものは直ちに閉じる。
-func (p *loopbackProxy) apply(ports []int) []portmap.Mapping {
+// listenLoopback は `127.0.0.1` のみで TCP 待受を開く（§4.6.4: ゲストの LAN へ再露出させない）。
+func listenLoopback(port int) (net.Listener, error) {
+	return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+}
+
+// apply はホストが広告した共有ポート集合へ待受を合わせ、元ポート → 実待受ポートの対応を返す
+// （p が nil なら nil＝経路無効）。待受を開けなかったサービスは含まれない。
+func (p *loopbackProxy) apply(ports []int) map[int]int {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil
-	}
+	return p.set.apply(ports)
+}
 
-	want := make(map[int]bool, len(ports))
-	for _, port := range ports {
-		want[port] = true
-	}
-	// 共有から外れたものを直ちに解放する（§4.6.4 の即時解放）。
-	for port, e := range p.active {
-		if !want[port] {
-			e.fwd.close()
-			delete(p.active, port)
-			slog.Info("loopback プロキシを停止しました", "port", port, "local", e.local)
-		}
-	}
-
-	// 継続中のものは現在の写像を維持し、新規のものだけ待受を開く。claim は実際の bind 試行で、
-	// 「空いているか」の唯一確実な判定になる（先に確認してから bind する二段構えは競合する）。
-	pending := make([]int, 0, len(ports))
-	for _, port := range ports {
-		if _, ok := p.active[port]; !ok {
-			pending = append(pending, port)
-		}
-	}
-	opened := make(map[int]net.Listener, len(pending))
-	claim := func(candidate int) bool {
-		if p.inUseLocked(candidate) {
-			return false
-		}
-		ln, err := p.listen(candidate)
-		if err != nil {
-			return false
-		}
-		opened[candidate] = ln
-		return true
-	}
-	mappings, err := portmap.Assign(p.hostKey, pending, claim)
+// open は 1 サービス分の待受を開く（listenerSet が呼ぶ）。元ポート → 導出ポート → 線形探索の
+// 順で bind を試し、最初に成功したものを使う。
+//
+// 空きの判定は**実際の bind 試行**で行う。「空いているか確認してから bind し直す」二段構えは、
+// その間に他プロセスへ取られうるため採らない。
+func (p *loopbackProxy) open(port int, inUse func(int) bool) (portListener, int, error) {
+	cands, err := portmap.Candidates(p.hostKey, port)
 	if err != nil {
-		// ポートが有効範囲外・ホスト公開鍵が空。広告が壊れている場合で、開いた待受は捨てる。
-		for _, ln := range opened {
-			_ = ln.Close()
-		}
-		slog.Warn("loopback プロキシのポート写像を決められませんでした", "err", err)
-		return p.mappingsLocked()
+		// ポートが有効範囲外・ホスト公開鍵が空。広告が壊れている場合。
+		slog.Warn("loopback プロキシのポート写像を決められませんでした", "port", port, "err", err)
+		return nil, 0, err
 	}
-	for _, m := range mappings {
-		ln, ok := opened[m.Local]
-		if !ok {
-			continue // 起きないが、写像と待受の不整合で握ったままにしない
+	for _, local := range cands {
+		if inUse(local) {
+			continue // 自分の他の待受と衝突する候補は試さない
 		}
-		delete(opened, m.Local)
-		target := net.JoinHostPort(p.hostIP.String(), strconv.Itoa(m.Port))
-		p.active[m.Port] = &loopbackEntry{
-			fwd:   newForwarder(ln, target, p.dial),
-			local: m.Local, moved: m.Moved,
+		ln, lerr := p.listen(local)
+		if lerr != nil {
+			continue // 他プロセスが使用中。次の候補へ（衝突は通常系・§4.6.4）
 		}
+		target := net.JoinHostPort(p.hostIP.String(), strconv.Itoa(port))
 		slog.Info("loopback プロキシを開始しました",
-			"local", net.JoinHostPort("127.0.0.1", strconv.Itoa(m.Local)), "target", target, "moved", m.Moved)
+			"local", net.JoinHostPort("127.0.0.1", strconv.Itoa(local)), "target", target, "moved", local != port)
+		return newForwarder(ln, target, p.dial), local, nil
 	}
-	// 採用されなかった待受（Assign が別候補を選んだ場合）は閉じる。
-	for _, ln := range opened {
-		_ = ln.Close()
-	}
-	// 待受を開けなかったサービスを利用者へ知らせる（ポート衝突は通常系だが、全候補が埋まるのは
-	// 異常に近い＝名前解決またはメッシュIP 直接の経路へ案内する必要がある）。
-	for _, port := range pending {
-		if _, ok := p.active[port]; !ok {
-			slog.Warn("loopback プロキシの待受ポートを確保できませんでした（名前解決またはメッシュIP 直接で到達してください）", "port", port)
-		}
-	}
-	return p.mappingsLocked()
+	// 全候補が埋まるのは異常に近い（名前解決またはメッシュIP 直接の経路へ案内する必要がある）。
+	slog.Warn("loopback プロキシの待受ポートを確保できませんでした（名前解決またはメッシュIP 直接で到達してください）", "port", port)
+	return nil, 0, errNoLoopbackPort
 }
 
-// inUseLocked は当該ポートを自身が既に使っているかを返す（呼び出し側でロック済みであること）。
-// 自分の他の待受と衝突する候補を bind 前に除く。
-func (p *loopbackProxy) inUseLocked(port int) bool {
-	for _, e := range p.active {
-		if e.local == port {
-			return true
-		}
-	}
-	return false
-}
-
-// mappingsLocked は現在の写像を元ポートの昇順で返す（呼び出し側でロック済みであること）。
-// 並び順を固定するのは表示のちらつきとテストの非決定性を避けるため。
-func (p *loopbackProxy) mappingsLocked() []portmap.Mapping {
-	out := make([]portmap.Mapping, 0, len(p.active))
-	for port, e := range p.active {
-		out = append(out, portmap.Mapping{Port: port, Local: e.local, Moved: e.moved})
-	}
-	sortMappings(out)
-	return out
-}
-
-// closeAll は全ての待受を解放する（退出・解散・時間切れ・プロセス終了時）。以後の apply は
-// 何もしない。
+// closeAll は全ての待受を解放する（退出・解散・時間切れ・プロセス終了時）。
 func (p *loopbackProxy) closeAll() {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.closed = true
-	for port, e := range p.active {
-		e.fwd.close()
-		delete(p.active, port)
-	}
+	p.set.closeAll()
 }
 
-// sortMappings は元ポートの昇順へ並べる（件数は最大でも同時共有サービス数なので単純挿入で足る）。
-func sortMappings(ms []portmap.Mapping) {
-	for i := 1; i < len(ms); i++ {
-		for j := i; j > 0 && ms[j].Port < ms[j-1].Port; j-- {
-			ms[j], ms[j-1] = ms[j-1], ms[j]
-		}
+// applyLoopback は loopback プロキシの待受を共有中サービスへ合わせ、実際の待受ポートを list の
+// 各要素へ書き戻す（lp が nil なら何もしない＝経路無効）。共有から外れたサービスの待受は
+// ここで直ちに閉じられる。
+//
+// 待受を開けなかったサービスは Local が 0 のまま残る。表示からは消さない——名前解決とメッシュIP
+// 直接の経路では到達できるため、「この 1 経路だけ使えない」ことが分かる形で残す（§4.6.2）。
+func applyLoopback(lp *loopbackProxy, list []appstate.SharedService) {
+	if lp == nil {
+		return
+	}
+	ports := make([]int, 0, len(list))
+	for _, sv := range list {
+		ports = append(ports, sv.Port)
+	}
+	local := lp.apply(ports)
+	for i := range list {
+		list[i].Local = local[list[i].Port]
 	}
 }

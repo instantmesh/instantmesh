@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -54,14 +55,9 @@ func TestLoopbackKeepsPort(t *testing.T) {
 	p, _ := fakeLoopback(t, nil)
 
 	got := p.apply([]int{11434, 3000})
-	want := []portmap.Mapping{{Port: 3000, Local: 3000}, {Port: 11434, Local: 11434}} // 元ポートの昇順
-	if len(got) != len(want) {
-		t.Fatalf("写像 = %+v, want %+v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("写像[%d] = %+v, want %+v", i, got[i], want[i])
-		}
+	want := map[int]int{11434: 11434, 3000: 3000}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("写像 = %v, want %v", got, want)
 	}
 }
 
@@ -78,15 +74,14 @@ func TestLoopbackFallsBackDeterministically(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("写像 = %+v, want 1 件", got)
 	}
-	if got[0].Local != derived || !got[0].Moved {
-		t.Errorf("写像 = %+v, want Local=%d Moved=true", got[0], derived)
+	if got[11434] != derived {
+		t.Errorf("写像 = %v, want 11434 → %d（元ポートから退避）", got, derived)
 	}
 
 	// 別プロセス（次のセッション相当）でも同じ値になる。
 	q, _ := fakeLoopback(t, map[int]bool{11434: true})
-	again := q.apply([]int{11434})
-	if len(again) != 1 || again[0].Local != derived {
-		t.Errorf("再実行で変わった: %+v, want Local=%d", again, derived)
+	if again := q.apply([]int{11434}); again[11434] != derived {
+		t.Errorf("再実行で変わった: %v, want 11434 → %d", again, derived)
 	}
 }
 
@@ -105,8 +100,8 @@ func TestLoopbackAppliesDiff(t *testing.T) {
 
 	// 3000 が共有から外れる。11434 は張り替えない（確立済み接続を切らないため）。
 	got := p.apply([]int{11434})
-	if len(got) != 1 || got[0].Port != 11434 {
-		t.Fatalf("写像 = %+v, want 11434 のみ", got)
+	if len(got) != 1 || got[11434] != 11434 {
+		t.Fatalf("写像 = %v, want 11434 のみ", got)
 	}
 	again, _ := opened.Load(11434)
 	if again.(net.Listener).Addr().String() != firstAddr {
@@ -165,8 +160,8 @@ func TestLoopbackSkipsUnavailable(t *testing.T) {
 
 	p, _ := fakeLoopback(t, busy)
 	got := p.apply([]int{11434, 3000})
-	if len(got) != 1 || got[0].Port != 3000 {
-		t.Errorf("写像 = %+v, want 3000 のみ", got)
+	if len(got) != 1 || got[3000] != 3000 {
+		t.Errorf("写像 = %v, want 3000 のみ", got)
 	}
 }
 
@@ -178,8 +173,8 @@ func TestLoopbackRejectsInvalidAdvert(t *testing.T) {
 
 	// 範囲外のポートを含む広告。既存の待受は維持し、新規は開かない。
 	got := p.apply([]int{11434, 70000})
-	if len(got) != 1 || got[0].Port != 11434 {
-		t.Errorf("写像 = %+v, want 11434 のみ", got)
+	if len(got) != 1 || got[11434] != 11434 {
+		t.Errorf("写像 = %v, want 11434 のみ", got)
 	}
 }
 
@@ -212,13 +207,14 @@ func TestLoopbackRelaysToHost(t *testing.T) {
 
 	got := p.apply([]int{svcPort})
 	if len(got) != 1 {
-		t.Fatalf("写像 = %+v", got)
+		t.Fatalf("写像 = %v", got)
 	}
-	p.mu.Lock()
-	entry := p.active[svcPort]
-	p.mu.Unlock()
+	l, ok := p.set.listenerFor(svcPort)
+	if !ok {
+		t.Fatal("待受が開いていない")
+	}
 
-	c, err := net.Dial("tcp", entry.fwd.addr().String())
+	c, err := net.Dial("tcp", l.addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -283,7 +279,7 @@ func TestApplyPeerAdvertLoopback(t *testing.T) {
 		Names:       []string{"tanaka.mesh", "ollama.tanaka.mesh"},
 		Services:    []signaling.SharedService{{Name: "ollama.tanaka.mesh", Port: 11434}},
 	}
-	applyPeerAdvert(zone, store, "10.9.0.1", pi, true, p)
+	applyPeerAdvert(zone, store, "10.9.0.1", pi, p)
 
 	snap := store.snapshot()
 	if len(snap.Shared) != 1 {
@@ -305,7 +301,7 @@ func TestApplyPeerAdvertLoopback(t *testing.T) {
 	}
 
 	// 共有が止まれば待受も表示も消える。
-	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, true, p)
+	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, p)
 	if len(store.snapshot().Shared) != 0 {
 		t.Error("共有停止が表示へ反映されていない")
 	}

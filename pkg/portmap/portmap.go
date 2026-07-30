@@ -33,7 +33,12 @@ const (
 	MaxProbe = 64
 )
 
-// ポート番号の有効範囲（pkg/localsvc と同値。依存を作らないため定数で持つ）。
+// ポート番号の有効範囲。
+//
+// 同値の定数と検証は pkg/localsvc にもあるが、そちらは既知ポート表（Ollama・LM Studio 等の
+// 製品名）を抱えるパッケージなので依存しない。ポート番号の範囲は RFC 由来の普遍的な事実で、
+// 製品固有の知識を持たない本パッケージが独立に持つのが正しい（設計原則8）。
+// pkg/signaling も同じ理由で私有の上限値を持つ。
 const (
 	minPort = 1
 	maxPort = 65535
@@ -47,14 +52,14 @@ var ErrInvalidPort = errors.New("portmap: port out of range")
 var ErrNoHostKey = errors.New("portmap: host public key is required")
 
 // Mapping は 1 サービス分のポート写像。
+//
+// 「元ポートから退避したか」（UI が明示すべき事実・§4.6.4）は Local != Port そのものなので
+// 別のフィールドには持たせない。表示側（pkg/appstate）が同じ規則で導出する。
 type Mapping struct {
 	// Port は共有元（ホスト側）のポート番号。
 	Port int `json:"port"`
 	// Local はゲストの `127.0.0.1` で実際に待ち受けるポート番号。
 	Local int `json:"local"`
-	// Moved は元ポートが使えず代替ポートへ退避したかどうか。UI は真のとき「ポートが変わった」
-	// ことを明示する必要がある（§4.6.4: 実際の待受ポートを UI に明示する）。
-	Moved bool `json:"moved"`
 }
 
 // Derive は元ポートに対する代替ポートを決定的に導出する（要件 §4.6.4）。
@@ -129,7 +134,7 @@ func Assign(hostKey string, ports []int, claim func(port int) bool) ([]Mapping, 
 				continue
 			}
 			taken[c] = true
-			out = append(out, Mapping{Port: port, Local: c, Moved: c != port})
+			out = append(out, Mapping{Port: port, Local: c})
 			break
 		}
 	}

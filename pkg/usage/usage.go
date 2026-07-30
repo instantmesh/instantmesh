@@ -66,17 +66,17 @@ func New() *Recorder {
 
 // AddIn はピア → ホスト方向のバイト数を計上する。
 func (r *Recorder) AddIn(peer netip.Addr, port uint16, n int, now time.Time) {
-	r.add(Key{Peer: peer, Port: port}, int64(n), 0, now)
+	r.add(Key{Peer: peer, Port: port}, int64(n), 0, 0, now)
 }
 
 // AddOut はホスト → ピア方向のバイト数を計上する。
 func (r *Recorder) AddOut(peer netip.Addr, port uint16, n int, now time.Time) {
-	r.add(Key{Peer: peer, Port: port}, 0, int64(n), now)
+	r.add(Key{Peer: peer, Port: port}, 0, int64(n), 0, now)
 }
 
 // AddRequest はリクエスト 1 件を計上する（L7 ゲートを通る共有サービスのみ）。
 func (r *Recorder) AddRequest(peer netip.Addr, port uint16, now time.Time) {
-	r.addWith(Key{Peer: peer, Port: port}, now, func(e *entry) { e.requests++ })
+	r.add(Key{Peer: peer, Port: port}, 0, 0, 1, now)
 }
 
 // SetLimit はゲスト単位の上限を設定する（ゼロ値の Limit で解除）。
@@ -95,6 +95,17 @@ func (r *Recorder) LimitFor(peer netip.Addr) Limit {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.limits[peer]
+}
+
+// HasLimits はいずれかのゲストに上限が設定されているかを返す。
+//
+// 呼び出し側（cmd/client）は「上限を強制するために L7 で数える必要があるか」の判定に使う。
+// 上限の集合を持つのは本パッケージなので、外から個々のゲストを列挙して LimitFor を引き直す
+// 必要はない（表示状態にまだ現れていないゲストの上限も取りこぼさない）。
+func (r *Recorder) HasLimits() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.limits) > 0
 }
 
 // Exceeded はゲストが上限に達しているかを返す。上限未設定なら常に false。
@@ -117,15 +128,8 @@ func (r *Recorder) Exceeded(peer netip.Addr) bool {
 	return (l.MaxBytes > 0 && bytes >= l.MaxBytes) || (l.MaxRequests > 0 && reqs >= l.MaxRequests)
 }
 
-func (r *Recorder) add(k Key, in, out int64, now time.Time) {
-	r.addWith(k, now, func(e *entry) {
-		e.in += in
-		e.out += out
-	})
-}
-
-// addWith は計上単位を解決し、apply で集計値を更新する。
-func (r *Recorder) addWith(k Key, now time.Time, apply func(*entry)) {
+// add は計上単位を解決し、集計値へ加算する（全ての Add* の実体）。
+func (r *Recorder) add(k Key, in, out, reqs int64, now time.Time) {
 	if !k.Peer.IsValid() || k.Port == 0 {
 		return // 計上単位を特定できないものは記録しない
 	}
@@ -136,7 +140,9 @@ func (r *Recorder) addWith(k Key, now time.Time, apply func(*entry)) {
 		e = &entry{firstSeen: now}
 		r.entries[k] = e
 	}
-	apply(e)
+	e.in += in
+	e.out += out
+	e.requests += reqs
 	e.lastSeen = now
 }
 

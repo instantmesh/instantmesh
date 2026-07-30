@@ -94,6 +94,9 @@ type shareController struct {
 	store    *viewStore
 	fwd      *serviceForwarder
 	tun      *Tunnel
+	// gate はセッション中 1 個の L7 統制層（bind で生成・-tunnel 無効時は nil）。稼働中の待受が
+	// このポインタを握るため、キー要求の切替は待受を張り替えずに効く。
+	gate *l7Gate
 
 	// save はメッシュ名ラベルと共有の選択をローカル設定へ書き出す関数（付録C.9 D-14）。
 	// nil なら保存しない（`-config=` で無効化した場合・ヘッドレス運用）。秘密は渡さない。
@@ -151,6 +154,13 @@ func (c *shareController) bind(sess shareSession) {
 	if !c.keysOK {
 		c.reqKey = false // プランが下がったらキー要求も落とす（フェイルセーフ）
 	}
+	// L7 統制はセッション中 1 個のゲートで行う。計上先（Recorder）は仮想NIC が持つため、
+	// -tunnel 無効時は統制も計上もできない。
+	c.gate = nil
+	if sess.tun != nil {
+		c.gate = &l7Gate{keys: c.keys, rec: sess.tun.Usage(), now: time.Now}
+		c.gate.setRequireKey(c.reqKey)
+	}
 	selected := len(c.ports)
 	c.mu.Unlock()
 	// 選択がプランの同時共有サービス数を超える場合、実際に貸すのは先頭から上限までになる
@@ -174,6 +184,7 @@ func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd, c.tun = netip.Addr{}, "", nil, "", nil, nil, nil, nil
+	c.gate = nil
 	free := plan.MustLookup(plan.Free)
 	c.maxPorts, c.usageOK, c.keysOK, c.limitsOK = free.MaxSharedServices, free.UsageRecords, free.AccessKeys, free.GuestLimits
 	c.reqKey = false
@@ -183,22 +194,28 @@ func (c *shareController) reset() {
 // setPorts は共有するポート集合を設定し、名前配布と表示へ反映する。共有の実行はホストの明示的な
 // 選択によるという要件（§4.6.1）に対応する唯一の入口。ポートや名前が不正なら何も変更しない。
 func (c *shareController) setPorts(ports []int) error {
+	if err := c.storePorts(ports); err != nil {
+		return err
+	}
+	c.publish()
+	c.persist() // 次回起動でも同じサービスを貸せるようにする（付録C.9 D-14）
+	return nil
+}
+
+// storePorts は選択を検証して保持する（反映は呼び出し側の publish / persist が行う）。
+// 検証と反映を同じ臨界区間に収めるためロック下で両方を行う（ラベルは setLabel と同時に
+// 触られうるため、ここで読む必要がある）。
+func (c *shareController) storePorts(ports []int) error {
 	c.mu.Lock()
-	// 反映前に妥当性を確認する（範囲外ポート・名前数の上限超過をここで弾く）。ラベルは setLabel と
-	// 同時に触られうるためロック下で読む（検証と反映を同じ臨界区間に収める）。
+	defer c.mu.Unlock()
+	// 範囲外ポート・名前数の上限超過をここで弾く。
 	if _, _, err := localsvc.Advertise(c.label, ports); err != nil {
-		c.mu.Unlock()
 		return err
 	}
 	if len(ports) > c.maxPorts {
-		limit := c.maxPorts
-		c.mu.Unlock()
-		return fmt.Errorf("同時に共有できるサービスは %d 件までです（選択 %d 件）: %w", limit, len(ports), errShareLimit)
+		return fmt.Errorf("同時に共有できるサービスは %d 件までです（選択 %d 件）: %w", c.maxPorts, len(ports), errShareLimit)
 	}
 	c.ports = append([]int(nil), ports...)
-	c.mu.Unlock()
-	c.publish()
-	c.persist() // 次回起動でも同じサービスを貸せるようにする（付録C.9 D-14）
 	return nil
 }
 
@@ -359,32 +376,20 @@ func (c *shareController) publish() {
 	}
 }
 
-// gateLocked は現在の設定に応じた L7 ゲートを返す（呼び出し側でロック済みであること）。
-// キーを要求しない場合でも、上限が設定されていれば HTTP で数えるためゲートを立てる。
-// 到達制御（L4）のみで足りる場合は nil を返し、生 TCP 転送のままにする。
+// gateLocked は L7 ゲートを立てるべきかを判定し、立てるなら長命なゲートを返す（呼び出し側で
+// ロック済みであること）。キーを要求しない場合でも、上限が設定されていれば HTTP で数えるため
+// 立てる。到達制御（L4）のみで足りる場合は nil を返し、生 TCP 転送のままにする。
+//
+// 返すのは常に同じ 1 個のゲート（bind で生成）。設定の変更はゲート自身が抱えるため、待受を
+// 張り替えなくても各リクエストが現在値を読む。
 func (c *shareController) gateLocked() *l7Gate {
-	if c.tun == nil || (!c.reqKey && !c.limitsOK) {
+	if c.gate == nil {
+		return nil // 仮想NIC が無い（-tunnel 無効）＝計上も統制もできない
+	}
+	if !c.reqKey && !c.gate.rec.HasLimits() {
 		return nil
 	}
-	if !c.reqKey && !c.hasLimitsLocked() {
-		return nil
-	}
-	return &l7Gate{keys: c.keys, rec: c.tun.Usage(), now: time.Now, requireKey: c.reqKey}
-}
-
-// hasLimitsLocked はいずれかのゲストに上限が設定されているかを返す。
-func (c *shareController) hasLimitsLocked() bool {
-	if c.tun == nil || c.store == nil {
-		return false
-	}
-	for _, g := range c.store.snapshot().Guests {
-		if addr, err := netip.ParseAddr(g.AssignedIP); err == nil {
-			if l := c.tun.Usage().LimitFor(addr); l.MaxBytes > 0 || l.MaxRequests > 0 {
-				return true
-			}
-		}
-	}
-	return false
+	return c.gate
 }
 
 // setRequireKey は共有サービスへアクセスキーを要求するかを切り替える（有料プラン機能）。
@@ -395,8 +400,11 @@ func (c *shareController) setRequireKey(on bool) error {
 		return errControlPlan
 	}
 	c.reqKey = on
+	gate := c.gate
 	c.mu.Unlock()
-	c.publish() // 待受を張り替える（生 TCP 転送 ⇄ HTTP プロキシ）
+	// 稼働中の待受にも即座に効かせる（ゲートは長命なので張り替えは不要）。
+	gate.setRequireKey(on)
+	c.publish() // 生 TCP 転送 ⇄ HTTP プロキシの切り替えが要る場合はここで張り替わる
 	return nil
 }
 
@@ -447,24 +455,20 @@ func (c *shareController) control() controlView {
 	c.mu.Lock()
 	available, reqKey, keys := c.keysOK, c.reqKey, c.keys
 	c.mu.Unlock()
-	m := make(map[string]string)
-	for _, g := range keys.Guests() {
-		if k, ok := keys.KeyFor(g); ok {
-			m[g] = k
-		}
-	}
-	return controlView{Available: available, RequireKey: reqKey, Keys: m}
+	return controlView{Available: available, RequireKey: reqKey, Keys: keys.Snapshot()}
 }
 
 // applyPeerAdvert は受信した peer_info の広告をローカルへ取り込む。peerIP は送信元ピアの
-// メッシュIP。display が真なら共有中サービスの表示（ゲスト画面）も更新する。lp が非 nil なら
-// ゲスト側 loopback プロキシ（§4.6.4）の待受も広告へ合わせ、実際の待受ポートを表示へ載せる
-// （ホスト側は display=false・lp=nil で呼ぶ）。
+// メッシュIP。
+//
+// store が非 nil なら共有中サービスの表示も更新する（借りる側＝ゲストのみ。ホストは自分が貸して
+// いる内容を出すため、ゲストの広告で表示を書き換えない）。lp が非 nil ならゲスト側 loopback
+// プロキシ（§4.6.4）の待受も広告へ合わせ、実際の待受ポートを表示へ載せる。
 //
 // 名前は相手の自己申告であり、別人が同じ名前を名乗りうる。Zone は先着優先で衝突を拒否し、
 // ここでは pkg/meshname による構文検証を通してから取り込む。信頼の根拠は名前ではなく
 // 公開鍵の帯域外照合（SAS）である（要件 §4.6.3）。
-func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, display bool, lp *loopbackProxy) {
+func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, lp *loopbackProxy) {
 	addr, err := netip.ParseAddr(peerIP)
 	if err != nil {
 		return
@@ -476,7 +480,7 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 		slog.Warn("ピアの名前を取り込めませんでした", "peer_ip", peerIP, "err", err)
 		return
 	}
-	if !display {
+	if store == nil {
 		return
 	}
 
@@ -510,24 +514,3 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 	}
 }
 
-// applyLoopback は loopback プロキシの待受を共有中サービスへ合わせ、実際の待受ポートを list の
-// 各要素へ書き戻す（lp が nil なら何もしない＝経路無効）。
-//
-// 待受を開けなかったサービスは Local が 0 のまま残る。表示からは消さない——名前解決とメッシュIP
-// 直接の経路では到達できるため、「この 1 経路だけ使えない」ことが分かる形で残す（§4.6.2）。
-func applyLoopback(lp *loopbackProxy, list []appstate.SharedService) {
-	if lp == nil {
-		return
-	}
-	ports := make([]int, 0, len(list))
-	for _, sv := range list {
-		ports = append(ports, sv.Port)
-	}
-	local := make(map[int]int, len(list))
-	for _, m := range lp.apply(ports) {
-		local[m.Port] = m.Local
-	}
-	for i := range list {
-		list[i].Local = local[list[i].Port]
-	}
-}

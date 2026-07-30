@@ -86,23 +86,46 @@ function esc(s) {
 }
 function shortKey(k) { k = String(k || ''); return k.length > 20 ? k.slice(0, 20) + '…' : k; }
 
-async function post(path, body) {
+function showError(msg) {
+  errBox.hidden = false;
+  errBox.textContent = msg;
+}
+
+// post は操作を送る。成功時の応答 JSON を返し（本文が無ければ null）、失敗はエラーバナーへ出す。
+// after が渡されればそれを呼び、無ければ /api/state を引き直して再描画する。
+async function post(path, body, after) {
+  var out = null;
   try {
     var res = await fetch(path, {
       method: 'POST',
       headers: body ? {'Content-Type': 'application/json'} : {},
       body: body ? JSON.stringify(body) : null
     });
-    if (!res.ok) {
-      var t = await res.text();
-      errBox.hidden = false;
-      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + t;
+    if (res.ok) {
+      out = await res.json().catch(function() { return null; }); // 204 など本文なしは null
+    } else {
+      showError('操作に失敗しました (' + res.status + '): ' + (await res.text()));
     }
   } catch (e) {
-    errBox.hidden = false;
-    errBox.textContent = '通信エラー: ' + e;
+    showError('通信エラー: ' + e);
   }
-  poll();
+  if (after) { after(out); } else { poll(); }
+  return out;
+}
+
+// getJSON は表示用データを取得する。一時的な失敗は次回のポーリングで回復するため、
+// 呼び出し側は null を「まだ取れていない」として扱う。
+async function getJSON(path) {
+  try {
+    return await (await fetch(path)).json();
+  } catch (e) {
+    return null;
+  }
+}
+
+// rerender は取得したデータを反映するために最後のスナップショットで描き直す。
+function rerender() {
+  if (lastSnap) render(lastSnap);
 }
 
 function idleHTML() {
@@ -123,30 +146,17 @@ function idleHTML() {
 }
 
 async function loadConfig() {
-  try {
-    conf = await (await fetch('/api/config')).json();
-    if (lastSnap) render(lastSnap);
-  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+  var v = await getJSON('/api/config');
+  if (v) { conf = v; rerender(); }
 }
 
 // saveMeshName はメッシュ名ラベルを保存する（付録C.9 D-14）。応答は適用後の設定なので、
 // サーバーが正規化した名前（例 "Tanaka Note" → "tanaka-note"）がそのまま画面へ反映される。
-async function saveMeshName(label) {
-  try {
-    var res = await fetch('/api/config', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({meshLabel: label})
-    });
-    if (res.ok) {
-      conf = await res.json();
-    } else {
-      errBox.hidden = false;
-      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + (await res.text());
-    }
-  } catch (e) {
-    errBox.hidden = false;
-    errBox.textContent = '通信エラー: ' + e;
-  }
-  if (lastSnap) render(lastSnap);
+function saveMeshName(label) {
+  return post('/api/config', {meshLabel: label}, function(out) {
+    if (out) { conf = out; }
+    rerender();
+  });
 }
 
 // nameSection はメッシュ名（ゲストが共有サービスへ到達するときのホスト名）を編集させる。
@@ -167,27 +177,16 @@ function nameSection() {
 }
 
 async function loadControl() {
-  try {
-    control = await (await fetch('/api/control')).json();
-  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+  var v = await getJSON('/api/control');
+  if (v) { control = v; }
 }
 
 // postControl は統制の操作を送り、結果（発行されたキー等）を取り込んで再描画する。
-async function postControl(body) {
-  try {
-    var res = await fetch('/api/control', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      errBox.hidden = false;
-      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + (await res.text());
-    }
-  } catch (e) {
-    errBox.hidden = false;
-    errBox.textContent = '通信エラー: ' + e;
-  }
-  await loadControl();
-  if (lastSnap) render(lastSnap);
+function postControl(body) {
+  return post('/api/control', body, async function() {
+    await loadControl();
+    rerender();
+  });
 }
 
 // controlSection はゲストごとのアクセスキーを提示する（§4.7）。キーはホストが帯域外で
@@ -220,10 +219,8 @@ function controlSection(s) {
 }
 
 async function loadUsage() {
-  try {
-    var res = await fetch('/api/usage');
-    usage = await res.json();
-  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+  var v = await getJSON('/api/usage');
+  if (v) { usage = v; }
 }
 
 function fmtBytes(n) {
@@ -255,14 +252,10 @@ function usageSection(s) {
 async function loadServices() {
   if (servicesLoading) return;
   servicesLoading = true;
-  try {
-    var res = await fetch('/api/services');
-    services = (await res.json()).services || [];
-  } catch (e) {
-    services = [];
-  }
+  var v = await getJSON('/api/services');
+  services = (v && v.services) || [];
   servicesLoading = false;
-  if (lastSnap) render(lastSnap);
+  rerender();
 }
 
 // initSelected は共有の選択状態を、サーバー側の共有中一覧から一度だけ復元する。

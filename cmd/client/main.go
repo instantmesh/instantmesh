@@ -349,7 +349,7 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			if ip, ok := store.guestIP(pi.PubKey); ok {
 				// ゲストが名前を広告してきた場合はゾーンへ取り込む（表示は貸す側＝ホストの
 				// 共有内容を出すため更新しない。loopback プロキシは借りる側の手段なので使わない）。
-				applyPeerAdvert(zone, store, ip, pi, false, nil)
+				applyPeerAdvert(zone, nil, ip, pi, nil)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.HostPeer(pi.PubKey, ip, endpoint)
 				}
@@ -521,7 +521,7 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 				// ホストが広告した名前と共有中サービスを取り込む（名前はホストの自己申告であり、
 				// 信頼の根拠は照合済みのホスト公開鍵の方である・§4.6.3）。loopback プロキシが
 				// 有効なら待受もここで広告へ追従する（共有停止で直ちに閉じる・§4.6.4）。
-				applyPeerAdvert(zone, store, hostIP, pi, true, lp)
+				applyPeerAdvert(zone, store, hostIP, pi, lp)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.GuestPeer(hostPubKey, hostIP, endpoint)
 				}

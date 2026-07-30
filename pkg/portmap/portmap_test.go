@@ -191,7 +191,7 @@ func TestAssignFallsBackDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
-	if len(first) != 1 || !first[0].Moved {
+	if len(first) != 1 || first[0].Local == first[0].Port {
 		t.Fatalf("Assign = %+v, want 退避 1 件", first)
 	}
 	derived, err := Derive(hostKey, 11434)

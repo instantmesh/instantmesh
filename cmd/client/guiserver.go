@@ -163,6 +163,12 @@ func (s *guiServer) guard(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// writeJSON は値を JSON で返す（200）。LocalAPI の応答はすべてこれを通す。
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 // handleIndex は埋め込み SPA を返す（"/" 以外のパスは 404）。
 func (s *guiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -177,8 +183,7 @@ func (s *guiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 // 生存信号（ハートビート）とみなして時刻を更新し、途絶＝ブラウザが閉じられたと監視ゴルーチンが判定する。
 func (s *guiServer) handleState(w http.ResponseWriter, r *http.Request) {
 	s.touchHeartbeat()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.store.snapshot())
+	writeJSON(w, s.store.snapshot())
 }
 
 // handleQR は現在の招待リンクを QR コードの SVG 画像で返す（ホストの招待リンク表示用）。
@@ -215,8 +220,7 @@ func (s *guiServer) handleServices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ローカルサービスの検出に失敗しました", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"services": cands})
+	writeJSON(w, map[string]any{"services": cands})
 }
 
 // handleUsage は共有サービスの利用記録（要件 §4.7）を返す。閲覧は有料プラン限定（§5）で、
@@ -227,8 +231,7 @@ func (s *guiServer) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if records == nil {
 		records = []usage.Record{}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"available": ok, "records": records})
+	writeJSON(w, map[string]any{"available": ok, "records": records})
 }
 
 // handleShare は共有するローカルサービス（ポート集合）を設定する。body は {"ports": [11434, ...]}。
@@ -258,8 +261,7 @@ func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
 // handleConfig はローカル設定（メッシュ名ラベル・共有の選択・保存の有効/無効）を返す
 // （付録C.9 D-14）。返すのは表示設定のみで、秘密鍵・トークンは載せない（設計原則2・3）。
 func (s *guiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.share.settings())
+	writeJSON(w, s.share.settings())
 }
 
 // handleConfigUpdate はメッシュ名ラベルを変更する。body は {"meshLabel": "tanaka"}。
@@ -279,14 +281,12 @@ func (s *guiServer) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "メッシュ名には英小文字・数字・ハイフンを使ってください", http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.share.settings())
+	writeJSON(w, s.share.settings())
 }
 
 // handleControl は統制（アクセスキー・上限）の現在値を返す（要件 §4.7）。
 func (s *guiServer) handleControl(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.share.control())
+	writeJSON(w, s.share.control())
 }
 
 // handleControlUpdate は統制の操作をまとめて受ける（要件 §4.7・有料プラン機能）。
@@ -342,8 +342,7 @@ func (s *guiServer) handleControlUpdate(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // writeControlErr は統制操作の失敗を HTTP 応答へ写す。

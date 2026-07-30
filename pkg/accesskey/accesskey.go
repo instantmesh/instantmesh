@@ -105,11 +105,16 @@ func (r *Registry) Guests() []string {
 	return out
 }
 
-// Len は発行済みキー数を返す。
-func (r *Registry) Len() int {
+// Snapshot は発行済みのゲスト → キーの対応を複製して返す（表示・配布用）。
+// 1 回のロックで全件を写すため、呼び出し側が Guests と KeyFor を組み合わせる必要はない。
+func (r *Registry) Snapshot() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.byGuest)
+	out := make(map[string]string, len(r.byGuest))
+	for g, k := range r.byGuest {
+		out[g] = k
+	}
+	return out
 }
 
 // Reset は全てのキーを失効させる（セッション終了時）。

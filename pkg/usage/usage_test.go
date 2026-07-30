@@ -93,10 +93,17 @@ func TestRequestsAndLimits(t *testing.T) {
 	if r.Exceeded(alice) {
 		t.Error("上限未設定で超過扱いになった")
 	}
+	if r.HasLimits() {
+		t.Error("上限未設定で HasLimits が真になった")
+	}
 	// リクエスト数の上限。
 	r.SetLimit(alice, Limit{MaxRequests: 2})
 	if !r.Exceeded(alice) {
 		t.Error("リクエスト上限に達したのに超過でない")
+	}
+	// 上限が 1 件でもあれば HasLimits は真（呼び出し側が L7 で数える判定に使う）。
+	if !r.HasLimits() {
+		t.Error("上限を設定しても HasLimits が偽")
 	}
 	if r.Exceeded(bob) {
 		t.Error("他のゲストまで超過扱いになった（当該ゲストのみを遮断すべき）")
@@ -126,5 +133,9 @@ func TestRequestsAndLimits(t *testing.T) {
 	r.Forget(bob)
 	if got := r.LimitFor(bob); got.MaxBytes != 0 {
 		t.Errorf("Forget 後も上限が残る: %+v", got)
+	}
+	// 全ての上限が消えれば HasLimits も偽へ戻る（L7 ゲートを畳める判定になる）。
+	if r.HasLimits() {
+		t.Error("全ての上限を消しても HasLimits が真")
 	}
 }

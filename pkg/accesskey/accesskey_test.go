@@ -51,8 +51,8 @@ func TestReissueInvalidatesOld(t *testing.T) {
 	if _, ok := r.Verify(fresh); !ok {
 		t.Error("新キーが通らない")
 	}
-	if r.Len() != 1 {
-		t.Errorf("Len = %d, want 1", r.Len())
+	if got := r.Snapshot(); len(got) != 1 || got["guest-pk"] != fresh {
+		t.Errorf("Snapshot = %v, want guest-pk → 新キーの 1 件", got)
 	}
 }
 
@@ -88,8 +88,24 @@ func TestGuestsAndReset(t *testing.T) {
 	if len(got) != 2 || got[0] != "alice" || got[1] != "bob" {
 		t.Errorf("Guests = %v（昇順であるべき）", got)
 	}
+	// Snapshot は 1 回のロックで全件を写す（表示・配布用）。
+	snap := r.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Snapshot = %v, want 2 件", snap)
+	}
+	for _, g := range got {
+		if k, ok := r.KeyFor(g); !ok || snap[g] != k {
+			t.Errorf("Snapshot[%q] = %q, want %q", g, snap[g], k)
+		}
+	}
+	// 返すのは複製であり、変更してもレジストリへ波及しない。
+	delete(snap, "alice")
+	if _, ok := r.KeyFor("alice"); !ok {
+		t.Error("Snapshot の変更がレジストリへ波及した")
+	}
+
 	r.Reset()
-	if r.Len() != 0 || len(r.Guests()) != 0 {
+	if len(r.Guests()) != 0 || len(r.Snapshot()) != 0 {
 		t.Error("Reset 後もキーが残っている")
 	}
 }
