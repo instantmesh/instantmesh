@@ -45,9 +45,16 @@ func startForwarder(listen netip.AddrPort, target string, dial func(network, add
 	if err != nil {
 		return nil, err
 	}
+	return newForwarder(ln, target, dial), nil
+}
+
+// newForwarder は既に確立済みのリスナーで転送を開始する。ゲスト側 loopback プロキシ（§4.6.4）は
+// 「bind できたポートをそのまま使う」形で空きを判定するため、リスナーを先に握ってから渡す
+// （確認してから bind し直す二段構えは、その間に他プロセスへ取られうる）。
+func newForwarder(ln net.Listener, target string, dial func(network, addr string) (net.Conn, error)) *forwarder {
 	f := &forwarder{ln: ln, target: target, dial: dial}
 	go f.accept()
-	return f, nil
+	return f
 }
 
 // addr は実際の待受アドレスを返す（ポート 0 指定時の確認用）。

@@ -299,7 +299,7 @@ func TestApplyPeerAdvertGuest(t *testing.T) {
 			{Name: "bad_name.mesh", Port: 8080},             // 構文不正 → 無視
 		},
 	}
-	applyPeerAdvert(zone, store, "10.9.0.1", pi, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", pi, true, nil)
 
 	if addr, ok := zone.Lookup("ollama.tanaka.mesh"); !ok || addr != netip.MustParseAddr("10.9.0.1") {
 		t.Errorf("ゾーン = %v, %v", addr, ok)
@@ -317,7 +317,7 @@ func TestApplyPeerAdvertGuest(t *testing.T) {
 	}
 
 	// 名前を空にした再広告は登録を取り消す。
-	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, true, nil)
 	if _, ok := zone.Lookup("ollama.tanaka.mesh"); ok {
 		t.Error("再広告で登録が消えていない")
 	}
@@ -329,12 +329,12 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 	store := newViewStore()
 
 	// メッシュIP が不正なら何もしない。
-	applyPeerAdvert(zone, store, "not-an-ip", signaling.PeerInfo{Names: []string{"a.mesh"}}, true)
+	applyPeerAdvert(zone, store, "not-an-ip", signaling.PeerInfo{Names: []string{"a.mesh"}}, true, nil)
 	if len(zone.Entries()) != 0 {
 		t.Error("不正なIPで登録された")
 	}
 	// ゾーン外の名前は取り込まない。
-	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{Names: []string{"evil.example.com"}}, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{Names: []string{"evil.example.com"}}, true, nil)
 	if len(zone.Entries()) != 0 {
 		t.Error("ゾーン外の名前が登録された")
 	}
@@ -343,7 +343,7 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 	if err := zone.Replace(first, []string{"tanaka.mesh"}); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
-	applyPeerAdvert(zone, store, "10.9.0.3", signaling.PeerInfo{Names: []string{"tanaka.mesh"}}, false)
+	applyPeerAdvert(zone, store, "10.9.0.3", signaling.PeerInfo{Names: []string{"tanaka.mesh"}}, false, nil)
 	if addr, _ := zone.Lookup("tanaka.mesh"); addr != first {
 		t.Errorf("名前が乗っ取られた: %v", addr)
 	}

@@ -457,12 +457,14 @@ func (c *shareController) control() controlView {
 }
 
 // applyPeerAdvert は受信した peer_info の広告をローカルへ取り込む。peerIP は送信元ピアの
-// メッシュIP。display が真なら共有中サービスの表示（ゲスト画面）も更新する。
+// メッシュIP。display が真なら共有中サービスの表示（ゲスト画面）も更新する。lp が非 nil なら
+// ゲスト側 loopback プロキシ（§4.6.4）の待受も広告へ合わせ、実際の待受ポートを表示へ載せる
+// （ホスト側は display=false・lp=nil で呼ぶ）。
 //
 // 名前は相手の自己申告であり、別人が同じ名前を名乗りうる。Zone は先着優先で衝突を拒否し、
 // ここでは pkg/meshname による構文検証を通してから取り込む。信頼の根拠は名前ではなく
 // 公開鍵の帯域外照合（SAS）である（要件 §4.6.3）。
-func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, display bool) {
+func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, display bool, lp *loopbackProxy) {
 	addr, err := netip.ParseAddr(peerIP)
 	if err != nil {
 		return
@@ -492,6 +494,9 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 		label, _ := localsvc.LabelFor(s.Port)
 		list = append(list, appstate.SharedService{Port: s.Port, Label: label, Name: name, Addr: peerIP})
 	}
+	// ゲスト側 loopback プロキシ（副の経路・§4.6.4）を広告へ合わせ、実際の待受ポートを表示へ載せる。
+	// 共有から外れたサービスの待受はここで直ちに閉じられる（apply が差分適用する）。
+	applyLoopback(lp, list)
 	hostName := ""
 	if len(pi.Names) > 0 {
 		hostName = meshname.Normalize(pi.Names[0]) // 送信側 Advertise の先頭はピア自身の名前
@@ -502,5 +507,27 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 	})
 	if len(list) > 0 {
 		slog.Info("共有サービスの広告を受信しました", "count", len(list), "host_name", hostName)
+	}
+}
+
+// applyLoopback は loopback プロキシの待受を共有中サービスへ合わせ、実際の待受ポートを list の
+// 各要素へ書き戻す（lp が nil なら何もしない＝経路無効）。
+//
+// 待受を開けなかったサービスは Local が 0 のまま残る。表示からは消さない——名前解決とメッシュIP
+// 直接の経路では到達できるため、「この 1 経路だけ使えない」ことが分かる形で残す（§4.6.2）。
+func applyLoopback(lp *loopbackProxy, list []appstate.SharedService) {
+	if lp == nil {
+		return
+	}
+	ports := make([]int, 0, len(list))
+	for _, sv := range list {
+		ports = append(ports, sv.Port)
+	}
+	local := make(map[int]int, len(list))
+	for _, m := range lp.apply(ports) {
+		local[m.Port] = m.Local
+	}
+	for i := range list {
+		list[i].Local = local[list[i].Port]
 	}
 }

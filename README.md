@@ -68,7 +68,7 @@ InstantMesh は「**必要なときだけ即席で貸し、終われば自動で
 4. ホストが承認すると、登録なしで即座に仮想ネットワークへ参加。
 5. **共有されたサービスに、セッションをまたいで安定した名前で到達できる**（例: `http://ollama.tanaka.mesh:11434`）。メッシュIPはセッションごとに変わりますが**名前は変わらない**ので、`.env`・手順書・CI にそのまま書けます。
 6. 割り当てられたプライベートIP（例: `10.0.0.x`）による直接通信（Ping、割当IP経由のローカル共有、任意ポートへのアクセス）も従来どおり可能。
-7. OS の DNS 設定を変更できない環境（MDM 管理端末等）では、`http://127.0.0.1:11434` に同一ポートで出す loopback プロキシを代替手段として使えます（TCP のみ）。
+7. OS の DNS 設定を変更できない環境（MDM 管理端末等）では、`-loopback` を付けると `http://127.0.0.1:11434` に同一ポートで出す loopback プロキシを代替手段として使えます（TCP のみ）。ポートが埋まっている場合は決定的に導出した代替ポートへ退避し（同じホスト・同じサービスなら毎回同じ値）、実際の待受を画面に明示します。
 
 > 「ファイル共有」は割当IP経由で SMB 等のローカル共有に到達できるという**接続性の説明**であり、専用のファイル共有機能を提供するものではありません。
 
@@ -213,7 +213,7 @@ instant-mesh/
     ├── relay / relayhub / relayframe               # データプレーン（リレー中継・通信量メータ/スロットル・ワイヤフレーム）
     ├── stun / stunmux / wgstat / connmon           # NATトラバーサル（STUN・WGソケット相乗り・直通成否検知・直通⇄リレー状態機械）
     ├── wgkey / secret / invite / qr / signalclient / wsconn / wgconf / meshpeer / netcfg / appstate / originguard / oauthpkce / clientconf  # クライアント基盤（鍵・秘密情報の安全保持・招待・QR画像化・シグナリング・WG設定・ピア写像・NIC設定・GUIビューモデル・LocalAPI防御・OAuth PKCE 認可・ローカル設定の表現/正規化）
-    └── localsvc / meshname / dnsmsg / pktfilter / usage / accesskey  # 共有層（ローカルサービスの既知ポート表・共有候補の組み立て／`.mesh` 名前空間と名前⇄メッシュIPの写像／DNS メッセージの解析・応答組み立て／共有していない宛先の遮断判定／利用記録の集計／ゲストごとのアクセスキー）
+    └── localsvc / meshname / dnsmsg / pktfilter / usage / accesskey / portmap  # 共有層（ローカルサービスの既知ポート表・共有候補の組み立て／`.mesh` 名前空間と名前⇄メッシュIPの写像／DNS メッセージの解析・応答組み立て／共有していない宛先の遮断判定／利用記録の集計／ゲストごとのアクセスキー／loopback プロキシのポート写像）
 ```
 
 各パッケージの役割と進捗は [`TODO.md`](TODO.md) を参照。テストカバレッジは CI（GitHub Actions）の `go test ./... -cover` で確認でき、純粋ロジック（`pkg/`）は全パッケージ 100% カバレッジを維持しています。

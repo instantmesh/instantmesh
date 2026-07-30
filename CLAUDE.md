@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 InstantMesh は、**手元のローカルAI（ローカルLLM／MCP サーバー／開発サーバー）を、公開URLを発行せずに特定の相手へ一時的に貸し出すためのアクセス層**。基盤はアカウント登録不要・使い終われば自動消滅するエフェメラルな Mesh VPN（WireGuard ベースの E2E 暗号化 P2P ネットワーク）で、その上に「共有するサービスを選んで貸す」導線（要件 §4.6）と「誰にどれだけ貸したかを制御・記録する」層（§4.7）を載せる。フェーズ1（Windows/macOS/Linux デスクトップ）を実装中。全体像・要件は `README.md` と `docs/`、進捗の詳細は `TODO.md` が正。
 
-> **2026-07-27 方向転換**: 前面を「汎用の一時メッシュVPN」から上記へ寄せた。汎用メッシュ機能（任意ポート・汎用ルーム）は削らず土台として残す。判断の根拠・却下した代替案・残存リスクは `docs/要件定義書.md` **付録C** が正。共有層は §4.6.1（サービス検出）・§4.6.3（名前解決）まで実装済みで、§4.6.4（loopback プロキシ）と §4.7（統制）は**未実装**。
+> **2026-07-27 方向転換**: 前面を「汎用の一時メッシュVPN」から上記へ寄せた。汎用メッシュ機能（任意ポート・汎用ルーム）は削らず土台として残す。判断の根拠・却下した代替案・残存リスクは `docs/要件定義書.md` **付録C** が正。共有層は §4.6（サービス検出・名前解決・loopback プロキシ）と §4.7（統制）まで実装済みで、**残るのは実機検証**（`docs/実機検証チェックリスト.md`）と GUI 第一画面の組み替え（§3.1）。
 
 ## 検証・ビルドのワークフロー（重要）
 
@@ -44,9 +44,11 @@ go run ./cmd/client -mode host  -server ws://localhost:8080/ws -cognito-domain= 
 
 # ゲスト（ヘッドレス CLI。招待リンクから参加 → 帯域外MITM照合）
 go run ./cmd/client -mode guest -invite "instantmesh://join?..." -nick alice  # -tunnel/-stun 既定有効
+# 借りたサービスを自分の 127.0.0.1 へ出す（副の到達手段・§4.6.4。既定は無効）
+go run ./cmd/client -mode guest -loopback -invite "instantmesh://join?..." -nick alice
 ```
 
-`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（優先順位は `-mesh-name` > 保存済み設定 > OS のホスト名）。`-config` はローカル設定（メッシュ名ラベル・共有するサービスの選択）の保存先（既定は OS のユーザ設定ディレクトリの `InstantMesh/config.json`・空文字で読み込みも保存も無効。**秘密鍵・招待トークン・アクセスキーは保存しない**・付録C.9 D-14）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
+`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（優先順位は `-mesh-name` > 保存済み設定 > OS のホスト名）。`-config` はローカル設定（メッシュ名ラベル・共有するサービスの選択）の保存先（既定は OS のユーザ設定ディレクトリの `InstantMesh/config.json`・空文字で読み込みも保存も無効。**秘密鍵・招待トークン・アクセスキーは保存しない**・付録C.9 D-14）。`-loopback` は借りたサービスをゲストの `127.0.0.1` へ出す副の到達手段（**既定 false**・要 `-tunnel`・TCP のみ・§4.6.4）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
 
 ## アーキテクチャ
 
@@ -100,7 +102,7 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 2. **メッシュIP直接** `http://10.0.0.1:11434` … 既存の到達性。削らない。
 
 > **前提（付録C.9 D-10・実装済み）**: `127.0.0.1` バインドのサービスにはメッシュIP 宛のパケットが届かないため、上記 (1)(2) はホスト側のユーザ空間転送（メッシュIP:ポート → `localhost`:ポート・`cmd/client/svcforward.go`）が無いと成立しない。OS の DNAT は使わない。共有の選択は D-11（`cmd/client/tunfilter.go` が `tun.Device` を包み、共有していない宛先への**新規接続**を落とす）により到達制御として効く。ICMP と自メッシュIP の `:53` は常に通す。同じ地点でゲスト別・共有別の通信量を計上する（`pkg/usage`・閲覧は Pro 限定）。切り分け用の無効化は `-share-guard=false`。
-3. **loopback プロキシ（副）** `http://127.0.0.1:11434` … OS の DNS を触れない環境向けの代替。**TCP のみ**。衝突時の代替ポートは決定的に導出する（ランダム割当は不可）。
+3. **loopback プロキシ（副・実装済み）** `http://127.0.0.1:11434` … OS の DNS を触れない環境向けの代替。`-loopback` で明示的に有効化する（**既定 false**・要 `-tunnel`）。**TCP のみ**・ゲスト側は `127.0.0.1` 限定 bind。ポート写像は `pkg/portmap`（元ポートを保存し、埋まっていれば `20000 + SHA256(ホスト公開鍵 ‖ 元ポート) mod 10000` へ**決定的に**退避 → 線形探索。ランダム割当は不可）、待受の駆動は `cmd/client/loopback.go`。空きの判定は実際の bind 試行で行い、実待受ポートは `appstate.SharedService.Local` 経由で GUI に明示する。
 
 実装時の必須事項: split DNS の**起動時残骸回収**（実装済み: `cleanupStaleSplitDNS`）、当該サフィックス**以外のクエリ経路を変更しない**スコープ厳守、プロキシの**即時解放**（ホストが元ポートを占有し続けるとゲストが自分の同種サービスを起動できない）、ホスト側サービスに `0.0.0.0` バインドを要求しないこと。名前は自己申告であり、信頼の根拠は SAS による公開鍵の帯域外照合であること（UI にも明示する）。
 

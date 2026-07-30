@@ -294,8 +294,9 @@ function servicesSection(s) {
 }
 
 // sharedSection は共有中サービスの到達 URL を提示する（ホスト＝自分が貸しているもの／
-// ゲスト＝ホストから広告されたもの）。URL は名前（要件 §4.6.2 経路(1)）とメッシュIP直接
-// （経路(2)）の 2 系統を、いずれもスキーム込みの完全な形でコピーさせる（§4.6.3）。
+// ゲスト＝ホストから広告されたもの）。URL は名前（要件 §4.6.2 経路(1)）・メッシュIP直接
+// （経路(2)）・loopback プロキシ（経路(3)・ゲストのみ）を、いずれもスキーム込みの完全な形で
+// コピーさせる（§4.6.3）。
 function sharedSection(s) {
   var list = s.shared || [];
   if (!list.length) return '';
@@ -303,9 +304,16 @@ function sharedSection(s) {
     var named = v.url
       ? '<code>' + esc(v.url) + '</code><button data-copy="' + esc(v.url) + '">コピー</button>'
       : '<span class="muted">名前解決は無効です（メッシュIPで到達してください）</span>';
+    // loopback プロキシ（-loopback で有効化した場合のみ）。元ポートが埋まっていた場合は
+    // 決定的に導出した代替ポートで待ち受けているため、実際の値を明示する（§4.6.4）。
+    var loop = v.localUrl
+      ? '<br><code>' + esc(v.localUrl) + '</code><button data-copy="' + esc(v.localUrl) + '">コピー</button>' +
+        (v.localMoved ? ' <span class="muted">元のポートが使用中のため別ポートで待受中</span>' : '')
+      : '';
     return '<li class="row"><div><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span>' +
       '<br>' + named +
-      '<br><code>' + esc(v.meshUrl) + '</code><button data-copy="' + esc(v.meshUrl) + '">コピー</button></div></li>';
+      '<br><code>' + esc(v.meshUrl) + '</code><button data-copy="' + esc(v.meshUrl) + '">コピー</button>' +
+      loop + '</div></li>';
   }).join('');
   return '<section class="card"><h2>共有中（' + list.length + '）</h2>' +
     '<p class="muted">到達できるのは承認済みのゲストだけです。名前は自己申告であり本人確認の根拠にはなりません' +

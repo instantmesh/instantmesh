@@ -60,6 +60,7 @@ type guiOptions struct {
 	meshName   string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
 	useDNS     bool          // 共有サービスの名前解決を有効にする
 	shareGuard bool          // 共有していない宛先への到達を遮断する
+	loopback   bool          // 借りたサービスを自分の 127.0.0.1 へ出す（副の到達手段・§4.6.4）
 	// sharedPorts は保存済み設定から復元した共有の選択（付録C.9 D-14。無ければ nil）。
 	sharedPorts []int
 	// saveConf はメッシュ名・共有の選択をローカル設定へ書き出す関数（nil なら保存しない）。
@@ -409,7 +410,7 @@ func (s *guiServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	cfg := guestConfig{
 		inviteURL: req.Invite, nick: nick, useTunnel: s.opts.useTunnel,
 		ifname: s.opts.ifname, stunAddr: s.opts.stunAddr, relay: s.opts.relay,
-		useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard,
+		useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard, loopback: s.opts.loopback,
 	}
 	err := s.startSession(func(ctx context.Context) error {
 		return s.startGuest(ctx, cfg, s.store, s.setClient)
