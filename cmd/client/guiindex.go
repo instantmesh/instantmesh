@@ -63,6 +63,9 @@ var conn = document.getElementById('conn');
 var errBox = document.getElementById('err');
 var lastSig = '';
 var lastSnap = null;
+// lastSnapText は lastSnap の JSON 表現（再描画判定のシグネチャに使う）。サーバーから受けた
+// 生のテキストをそのまま持ち、毎秒の再シリアライズを省く。
+var lastSnapText = '';
 // ローカルサービス検出（要件 §4.6.1）の結果。null = 未取得。/api/state のポーリングとは別に、
 // ホスト画面に入ったとき一度だけ取得し、以後は「再検出」ボタンでのみ更新する（毎秒の走査を避ける）。
 var services = null;
@@ -71,6 +74,9 @@ var servicesLoading = false;
 // （要件 §4.6.1）、検出結果とは別に保持し、「共有を更新」を押したときだけサーバーへ送る。
 // null = 未初期化（ホスト画面に入ったときサーバー側の共有中一覧から復元する）。
 var selected = null;
+// ローカル設定（メッシュ名ラベル・共有の選択・保存の有効/無効。付録C.9 D-14）。null = 未取得。
+// セッションではなく端末の設定なので、画面遷移では捨てずに保持する。
+var conf = null;
 // 利用記録（要件 §4.7・閲覧は有料プラン）。/api/state とは別に緩やかな間隔で取得する。
 var usage = null;
 // アクセス統制（要件 §4.7・有料プラン）。キー要求の状態と発行済みキー。
@@ -83,23 +89,47 @@ function esc(s) {
 }
 function shortKey(k) { k = String(k || ''); return k.length > 20 ? k.slice(0, 20) + '…' : k; }
 
-async function post(path, body) {
+function showError(msg) {
+  errBox.hidden = false;
+  errBox.textContent = msg;
+}
+
+// post は操作を送る。成功時の応答 JSON を返し（本文が無ければ null）、失敗はエラーバナーへ出す。
+// after が渡されればそれを呼び、無ければ /api/state を引き直して再描画する。
+async function post(path, body, after) {
+  var out = null;
   try {
     var res = await fetch(path, {
       method: 'POST',
       headers: body ? {'Content-Type': 'application/json'} : {},
       body: body ? JSON.stringify(body) : null
     });
-    if (!res.ok) {
-      var t = await res.text();
-      errBox.hidden = false;
-      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + t;
+    if (res.ok) {
+      out = await res.json().catch(function() { return null; }); // 204 など本文なしは null
+    } else {
+      showError('操作に失敗しました (' + res.status + '): ' + (await res.text()));
     }
   } catch (e) {
-    errBox.hidden = false;
-    errBox.textContent = '通信エラー: ' + e;
+    showError('通信エラー: ' + e);
   }
-  poll();
+  if (after) { after(out); } else { poll(); }
+  return out;
+}
+
+// getJSON は表示用データを取得する。一時的な失敗は次回のポーリングで回復するため、
+// 呼び出し側は null を「まだ取れていない」として扱う。
+async function getJSON(path) {
+  try {
+    return await (await fetch(path)).json();
+  } catch (e) {
+    return null;
+  }
+}
+
+// rerender は取得したデータ（サービス一覧・設定・統制・利用記録）を反映するため、最後の
+// スナップショットで描き直す。表示状態そのものは変わらないので生 JSON も使い回す。
+function rerender() {
+  if (lastSnap) render(lastSnap, lastSnapText);
 }
 
 function idleHTML() {
@@ -115,31 +145,52 @@ function idleHTML() {
       '<label>招待リンク<textarea id="inv" rows="3" placeholder="instantmesh://join?..."></textarea></label>' +
       '<label>ニックネーム<input id="nick" type="text" placeholder="alice"></label>' +
       '<button id="btn-join">参加する</button>' +
-    '</section>';
+    '</section>' +
+    nameSection();
+}
+
+async function loadConfig() {
+  var v = await getJSON('/api/config');
+  if (v) { conf = v; rerender(); }
+}
+
+// saveMeshName はメッシュ名ラベルを保存する（付録C.9 D-14）。応答は適用後の設定なので、
+// サーバーが正規化した名前（例 "Tanaka Note" → "tanaka-note"）がそのまま画面へ反映される。
+function saveMeshName(label) {
+  return post('/api/config', {meshLabel: label}, function(out) {
+    if (out) { conf = out; }
+    rerender();
+  });
+}
+
+// nameSection はメッシュ名（ゲストが共有サービスへ到達するときのホスト名）を編集させる。
+// 名前はセッションをまたいで安定していることに価値があるため（要件 §4.6.2）、保存が有効なら
+// 次回起動でも同じ名前になる。保存するのは名前と共有の選択だけで、鍵やトークンは保存しない。
+function nameSection() {
+  if (!conf) return '';
+  var note = conf.persisted
+    ? 'この名前と共有の選択はこの端末に保存され、次回の起動でも同じ名前になります。秘密鍵・招待リンク・アクセスキーは保存しません。'
+    : '設定の保存は無効です（-config）。次回の起動では既定の名前に戻ります。';
+  return '<section class="card"><h2>メッシュ名</h2>' +
+    '<p class="muted">ゲストはこの名前で共有サービスへ到達します（例 <code>http://ollama.' +
+    esc(conf.meshLabel) + '.mesh:11434</code>）。' + esc(note) + '</p>' +
+    '<label>名前（英小文字・数字・ハイフン）<input id="mesh-label" value="' + esc(conf.meshLabel) + '"></label>' +
+    '<p class="muted">現在のホスト名 <code>' + esc(conf.meshName) + '</code>。' +
+    '変更すると、これまでゲストへ渡した名前は解決しなくなります（メッシュIP 直接の到達は変わりません）。</p>' +
+    '<div class="actions"><button id="btn-name">名前を保存</button></div></section>';
 }
 
 async function loadControl() {
-  try {
-    control = await (await fetch('/api/control')).json();
-  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+  var v = await getJSON('/api/control');
+  if (v) { control = v; }
 }
 
 // postControl は統制の操作を送り、結果（発行されたキー等）を取り込んで再描画する。
-async function postControl(body) {
-  try {
-    var res = await fetch('/api/control', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      errBox.hidden = false;
-      errBox.textContent = '操作に失敗しました (' + res.status + '): ' + (await res.text());
-    }
-  } catch (e) {
-    errBox.hidden = false;
-    errBox.textContent = '通信エラー: ' + e;
-  }
-  await loadControl();
-  if (lastSnap) render(lastSnap);
+function postControl(body) {
+  return post('/api/control', body, async function() {
+    await loadControl();
+    rerender();
+  });
 }
 
 // controlSection はゲストごとのアクセスキーを提示する（§4.7）。キーはホストが帯域外で
@@ -172,10 +223,8 @@ function controlSection(s) {
 }
 
 async function loadUsage() {
-  try {
-    var res = await fetch('/api/usage');
-    usage = await res.json();
-  } catch (e) { /* 一時的な失敗は次回のポーリングで回復する */ }
+  var v = await getJSON('/api/usage');
+  if (v) { usage = v; }
 }
 
 function fmtBytes(n) {
@@ -207,14 +256,10 @@ function usageSection(s) {
 async function loadServices() {
   if (servicesLoading) return;
   servicesLoading = true;
-  try {
-    var res = await fetch('/api/services');
-    services = (await res.json()).services || [];
-  } catch (e) {
-    services = [];
-  }
+  var v = await getJSON('/api/services');
+  services = (v && v.services) || [];
   servicesLoading = false;
-  if (lastSnap) render(lastSnap);
+  rerender();
 }
 
 // initSelected は共有の選択状態を、サーバー側の共有中一覧から一度だけ復元する。
@@ -246,8 +291,9 @@ function servicesSection(s) {
 }
 
 // sharedSection は共有中サービスの到達 URL を提示する（ホスト＝自分が貸しているもの／
-// ゲスト＝ホストから広告されたもの）。URL は名前（要件 §4.6.2 経路(1)）とメッシュIP直接
-// （経路(2)）の 2 系統を、いずれもスキーム込みの完全な形でコピーさせる（§4.6.3）。
+// ゲスト＝ホストから広告されたもの）。URL は名前（要件 §4.6.2 経路(1)）・メッシュIP直接
+// （経路(2)）・loopback プロキシ（経路(3)・ゲストのみ）を、いずれもスキーム込みの完全な形で
+// コピーさせる（§4.6.3）。
 function sharedSection(s) {
   var list = s.shared || [];
   if (!list.length) return '';
@@ -255,9 +301,16 @@ function sharedSection(s) {
     var named = v.url
       ? '<code>' + esc(v.url) + '</code><button data-copy="' + esc(v.url) + '">コピー</button>'
       : '<span class="muted">名前解決は無効です（メッシュIPで到達してください）</span>';
+    // loopback プロキシ（-loopback で有効化した場合のみ）。元ポートが埋まっていた場合は
+    // 決定的に導出した代替ポートで待ち受けているため、実際の値を明示する（§4.6.4）。
+    var loop = v.localUrl
+      ? '<br><code>' + esc(v.localUrl) + '</code><button data-copy="' + esc(v.localUrl) + '">コピー</button>' +
+        (v.localMoved ? ' <span class="muted">元のポートが使用中のため別ポートで待受中</span>' : '')
+      : '';
     return '<li class="row"><div><b>' + esc(v.label || ('ポート ' + v.port)) + '</b> <span class="muted">:' + v.port + '</span>' +
       '<br>' + named +
-      '<br><code>' + esc(v.meshUrl) + '</code><button data-copy="' + esc(v.meshUrl) + '">コピー</button></div></li>';
+      '<br><code>' + esc(v.meshUrl) + '</code><button data-copy="' + esc(v.meshUrl) + '">コピー</button>' +
+      loop + '</div></li>';
   }).join('');
   return '<section class="card"><h2>共有中（' + list.length + '）</h2>' +
     '<p class="muted">到達できるのは承認済みのゲストだけです。名前は自己申告であり本人確認の根拠にはなりません' +
@@ -298,6 +351,7 @@ function hostingHTML(s) {
       '<div class="qr"><img alt="招待QR" src="/api/qr?l=' + encodeURIComponent(s.inviteLink) + '"></div>' +
       '<p class="muted">SAS（ホスト鍵。ゲストへ帯域外で伝え、読み合わせて MITM を防ぐ）</p><code class="sas">' + esc(s.sas) + '</code>' +
     '</section>' +
+    nameSection() +
     servicesSection(s) +
     sharedSection(s) +
     usageSection(s) +
@@ -343,84 +397,83 @@ function screenHTML(s) {
   }
 }
 
-function wire(s) {
-  var h = document.getElementById('btn-host');
-  if (h) h.onclick = function() {
+// onClick は id の要素があれば操作を結び付ける（画面ごとに存在しないボタンがあるため）。
+function onClick(id, fn) {
+  var el = document.getElementById(id);
+  if (el) el.onclick = fn;
+}
+
+// onEach は data 属性を持つ全要素へ操作を結び付け、その属性値と要素を渡す（行ごとのボタン用）。
+// 要素の束縛はコールバックの引数に閉じるため、呼び出し側で IIFE を書く必要はない。
+function onEach(attr, event, fn) {
+  Array.prototype.forEach.call(document.querySelectorAll('[' + attr + ']'), function(el) {
+    el[event] = function() { fn(el.getAttribute(attr), el); };
+  });
+}
+
+// wire は描き直した DOM へ操作を結び付ける。参照するのはグローバルな取得済みデータ
+// （selected・control）だけで、表示状態そのものは HTML 側に描き込まれている。
+function wire() {
+  onClick('btn-host', function() {
     var v = parseInt(document.getElementById('dur').value, 10);
     post('/api/host', {duration: isNaN(v) ? 0 : v});
-  };
-  var j = document.getElementById('btn-join');
-  if (j) j.onclick = function() {
+  });
+  onClick('btn-join', function() {
     post('/api/join', {invite: document.getElementById('inv').value.trim(), nick: document.getElementById('nick').value.trim()});
-  };
-  var cp = document.getElementById('btn-copy');
-  if (cp) cp.onclick = function() {
+  });
+  onClick('btn-copy', function() {
     var el = document.getElementById('link');
     el.select();
     if (navigator.clipboard) navigator.clipboard.writeText(el.value);
-  };
-  var rt = document.getElementById('btn-rotate');
-  if (rt) rt.onclick = function() { post('/api/rotate'); };
-  var lv = document.getElementById('btn-leave');
-  if (lv) lv.onclick = function() { post('/api/leave'); };
-  var rs = document.getElementById('btn-restart');
-  if (rs) rs.onclick = function() { post('/api/reset'); };
-  var rc = document.getElementById('btn-rescan');
-  if (rc) rc.onclick = function() { loadServices(); };
-  var sh = document.getElementById('btn-share');
-  if (sh) sh.onclick = function() {
+  });
+  onClick('btn-rotate', function() { post('/api/rotate'); });
+  onClick('btn-leave', function() { post('/api/leave'); });
+  onClick('btn-restart', function() { post('/api/reset'); });
+  onClick('btn-rescan', function() { loadServices(); });
+  onClick('btn-share', function() {
     var ports = [];
     for (var p in selected) { if (selected[p]) ports.push(parseInt(p, 10)); }
     post('/api/share', {ports: ports});
-  };
-  var rk = document.getElementById('btn-require-key');
-  if (rk) rk.onclick = function() { postControl({requireKey: !(control && control.requireKey)}); };
-  var iks = document.querySelectorAll('[data-issue-key]');
-  for (var q = 0; q < iks.length; q++) (function(b) {
-    b.onclick = function() { postControl({issueKey: b.getAttribute('data-issue-key')}); };
-  })(iks[q]);
-  var rks = document.querySelectorAll('[data-revoke-key]');
-  for (var w = 0; w < rks.length; w++) (function(b) {
-    b.onclick = function() { postControl({revokeKey: b.getAttribute('data-revoke-key')}); };
-  })(rks[w]);
-  var cbs = document.querySelectorAll('[data-port]');
-  for (var m = 0; m < cbs.length; m++) (function(b) {
-    b.onchange = function() { selected[b.getAttribute('data-port')] = b.checked; };
-  })(cbs[m]);
-  var cus = document.querySelectorAll('[data-copy]');
-  for (var n = 0; n < cus.length; n++) (function(b) {
-    b.onclick = function() {
-      if (navigator.clipboard) navigator.clipboard.writeText(b.getAttribute('data-copy'));
-    };
-  })(cus[n]);
-  var els = document.querySelectorAll('[data-approve]');
-  for (var i = 0; i < els.length; i++) (function(b) { b.onclick = function() { post('/api/approve', {pubKey: b.getAttribute('data-approve')}); }; })(els[i]);
-  els = document.querySelectorAll('[data-reject]');
-  for (var k = 0; k < els.length; k++) (function(b) { b.onclick = function() { post('/api/reject', {pubKey: b.getAttribute('data-reject')}); }; })(els[k]);
+  });
+  onClick('btn-name', function() { saveMeshName(document.getElementById('mesh-label').value.trim()); });
+  onClick('btn-require-key', function() { postControl({requireKey: !(control && control.requireKey)}); });
+  onEach('data-issue-key', 'onclick', function(v) { postControl({issueKey: v}); });
+  onEach('data-revoke-key', 'onclick', function(v) { postControl({revokeKey: v}); });
+  onEach('data-port', 'onchange', function(v, el) { selected[v] = el.checked; });
+  onEach('data-copy', 'onclick', function(v) { if (navigator.clipboard) navigator.clipboard.writeText(v); });
+  onEach('data-approve', 'onclick', function(v) { post('/api/approve', {pubKey: v}); });
+  onEach('data-reject', 'onclick', function(v) { post('/api/reject', {pubKey: v}); });
 }
 
-function render(s) {
+// render は表示状態を描画する。text はサーバーから受け取った s の生 JSON（あれば）で、
+// 再描画判定のシグネチャに使い回して再シリアライズを省く。
+function render(s, text) {
   lastSnap = s;
+  lastSnapText = text || JSON.stringify(s);
   conn.textContent = s.role !== 'none' ? ('役割: ' + s.role + ' / ' + s.phase) : '';
   if (s.error) { errBox.hidden = false; errBox.textContent = 'エラー: ' + s.error; } else { errBox.hidden = true; }
   // ホスト画面へ入った最初の一度だけローカルサービスを走査する。
   if (s.phase === 'hosting' && services === null) loadServices();
   if (s.phase === 'hosting' && control === null) loadControl();
+  // 端末の設定（メッシュ名）は最初の一度だけ取得する。ルーム作成前に名前を決められるよう
+  // idle 画面でも出す（付録C.9 D-14）。
+  if (conf === null && (s.phase === 'idle' || s.phase === 'hosting')) loadConfig();
   // ホストを離れたら結果と選択を捨て、次にホストになったとき再走査・再復元させる。
   if (s.phase !== 'hosting' && services !== null && !servicesLoading) services = null;
   if (s.phase !== 'hosting') { selected = null; usage = null; control = null; }
   // 状態が変わったときだけ DOM を作り直す（入力保持・QR のちらつき防止）。
-  var sig = JSON.stringify(s) + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control);
+  var sig = lastSnapText + '|' + JSON.stringify(services) + '|' + JSON.stringify(selected) + '|' + JSON.stringify(usage) + '|' + JSON.stringify(control) + '|' + JSON.stringify(conf);
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
-  wire(s);
+  wire();
 }
 
 async function poll() {
   try {
-    var s = await (await fetch('/api/state')).json();
-    render(s);
+    // 生のテキストで受け取り、パースした値と一緒に render へ渡す（再描画判定で使い回す）。
+    var text = await (await fetch('/api/state')).text();
+    render(JSON.parse(text), text);
   } catch (e) { /* 一時的な取得失敗は無視して次のポーリングで回復する */ }
 }
 setInterval(poll, 1000);

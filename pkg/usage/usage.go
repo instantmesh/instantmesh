@@ -66,17 +66,28 @@ func New() *Recorder {
 
 // AddIn はピア → ホスト方向のバイト数を計上する。
 func (r *Recorder) AddIn(peer netip.Addr, port uint16, n int, now time.Time) {
-	r.add(Key{Peer: peer, Port: port}, int64(n), 0, now)
+	r.add(Key{Peer: peer, Port: port}, int64(n), 0, 0, now)
 }
 
 // AddOut はホスト → ピア方向のバイト数を計上する。
 func (r *Recorder) AddOut(peer netip.Addr, port uint16, n int, now time.Time) {
-	r.add(Key{Peer: peer, Port: port}, 0, int64(n), now)
+	r.add(Key{Peer: peer, Port: port}, 0, int64(n), 0, now)
 }
 
-// AddRequest はリクエスト 1 件を計上する（L7 ゲートを通る共有サービスのみ）。
-func (r *Recorder) AddRequest(peer netip.Addr, port uint16, now time.Time) {
-	r.addWith(Key{Peer: peer, Port: port}, now, func(e *entry) { e.requests++ })
+// AllowRequest はゲストが上限に達していなければリクエスト 1 件を計上して true を返す
+// （L7 ゲートを通る共有サービスのみ）。上限に達していれば計上せず false を返す。
+//
+// 判定と計上を 1 つの臨界区間で行うのは、境界での取りこぼしを防ぐため —— 別々に呼ぶと、
+// 上限直前の同時要求が両方とも判定を通過して上限を超えて計上されうる。ロックの往復も 1 回で済む
+// （同じロックはデータパスがパケットごとに取るため、保持回数を増やしたくない）。
+func (r *Recorder) AllowRequest(peer netip.Addr, port uint16, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.exceededLocked(peer) {
+		return false
+	}
+	r.addLocked(Key{Peer: peer, Port: port}, 0, 0, 1, now)
+	return true
 }
 
 // SetLimit はゲスト単位の上限を設定する（ゼロ値の Limit で解除）。
@@ -97,11 +108,24 @@ func (r *Recorder) LimitFor(peer netip.Addr) Limit {
 	return r.limits[peer]
 }
 
-// Exceeded はゲストが上限に達しているかを返す。上限未設定なら常に false。
-// 判定に使うのは当該ゲストの全共有サービスの合計。
-func (r *Recorder) Exceeded(peer netip.Addr) bool {
+// HasLimits はいずれかのゲストに上限が設定されているかを返す。
+//
+// 呼び出し側（cmd/client）は「上限を強制するために L7 で数える必要があるか」の判定に使う。
+// 上限の集合を持つのは本パッケージなので、外から個々のゲストを列挙して LimitFor を引き直す
+// 必要はない（表示状態にまだ現れていないゲストの上限も取りこぼさない）。
+func (r *Recorder) HasLimits() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return len(r.limits) > 0
+}
+
+// exceededLocked はゲストが上限に達しているかを返す（呼び出し側でロック済みであること）。
+// 上限未設定なら常に false。判定に使うのは当該ゲストの全共有サービスの合計。
+//
+// 走査は当該ゲストの記録に限られ、件数はゲスト数 × 共有サービス数（いずれもプラン上限あり・§5）で
+// 抑えられている。上限が設定されていないゲストは先頭で抜けるため、統制を使わない運用では走査自体が
+// 起きない。
+func (r *Recorder) exceededLocked(peer netip.Addr) bool {
 	l, ok := r.limits[peer]
 	if !ok {
 		return false
@@ -117,26 +141,26 @@ func (r *Recorder) Exceeded(peer netip.Addr) bool {
 	return (l.MaxBytes > 0 && bytes >= l.MaxBytes) || (l.MaxRequests > 0 && reqs >= l.MaxRequests)
 }
 
-func (r *Recorder) add(k Key, in, out int64, now time.Time) {
-	r.addWith(k, now, func(e *entry) {
-		e.in += in
-		e.out += out
-	})
+// add は計上単位を解決し、集計値へ加算する（バイト計上の実体）。
+func (r *Recorder) add(k Key, in, out, reqs int64, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addLocked(k, in, out, reqs, now)
 }
 
-// addWith は計上単位を解決し、apply で集計値を更新する。
-func (r *Recorder) addWith(k Key, now time.Time, apply func(*entry)) {
+// addLocked は集計値へ加算する（呼び出し側でロック済みであること）。
+func (r *Recorder) addLocked(k Key, in, out, reqs int64, now time.Time) {
 	if !k.Peer.IsValid() || k.Port == 0 {
 		return // 計上単位を特定できないものは記録しない
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	e, ok := r.entries[k]
 	if !ok {
 		e = &entry{firstSeen: now}
 		r.entries[k] = e
 	}
-	apply(e)
+	e.in += in
+	e.out += out
+	e.requests += reqs
 	e.lastSeen = now
 }
 
@@ -163,17 +187,6 @@ func (r *Recorder) Snapshot() []Record {
 		return out[i].Port < out[j].Port
 	})
 	return out
-}
-
-// Totals は全体の合計（受信・送信バイト）を返す。
-func (r *Recorder) Totals() (in, out int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.entries {
-		in += e.in
-		out += e.out
-	}
-	return in, out
 }
 
 // Forget は指定ピアの記録を消す（キック・離脱で記録を残さない運用にする場合に使う）。

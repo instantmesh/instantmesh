@@ -22,6 +22,7 @@ import (
 
 	"github.com/instantmesh/instantmesh/pkg/accesskey"
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
 	"github.com/instantmesh/instantmesh/pkg/plan"
@@ -43,12 +44,21 @@ var errControlPlan = errors.New("sharing: control features require the paid plan
 // errControlUnavailable は仮想NIC が無く統制を適用できないことを表す（-tunnel 無効時）。
 var errControlUnavailable = errors.New("sharing: control features require the tunnel")
 
-// meshHostLabel はメッシュ名に使うラベルを決める（-mesh-name 指定 > OS のホスト名 > "host"）。
+// errInvalidMeshLabel はメッシュ名ラベルとして使えない入力（英数字を含まない等）を表す。
+var errInvalidMeshLabel = errors.New("sharing: invalid mesh name label")
+
+// meshHostLabel はメッシュ名に使うラベルを決める。候補を優先順に受け取り、LDH ラベルへ落とせた
+// 最初のものを採る（呼び出し側の順序は -mesh-name 指定 > 保存済み設定）。いずれも使えなければ
+// OS のホスト名、それも無理なら "host"。
+//
 // 名前はセッションをまたいで安定していることに価値がある（ゲストの .env や手順書に書ける・
-// 要件 §4.6.2）ため、既定値も実行のたびに変わらない OS のホスト名から導出する。
-func meshHostLabel(flagValue string) string {
-	if l := meshname.Sanitize(flagValue); l != "" {
-		return l
+// 要件 §4.6.2）。だからこそ保存済み設定を候補に含め（付録C.9 D-14）、既定値も実行のたびに
+// 変わらない OS のホスト名から導出する。
+func meshHostLabel(candidates ...string) string {
+	for _, c := range candidates {
+		if l := meshname.Sanitize(c); l != "" {
+			return l
+		}
 	}
 	if h, err := os.Hostname(); err == nil {
 		if l := meshname.Sanitize(h); l != "" {
@@ -62,6 +72,11 @@ func meshHostLabel(flagValue string) string {
 // シグナリング受信ループの双方から触られるため、状態は mu で保護する。
 type shareController struct {
 	label string // メッシュ名のホストラベル（例 "tanaka"）
+
+	// pubMu は publish（状態の取得 → ゾーン・転送・到達制御・再広告への適用）を直列化する。
+	// 取得と適用を分けると、並行操作で古い内容が新しい内容を上書きしうる（外れたポートの待受が
+	// 残る・古い名前が配られる）。mu より先に取ること（この順序以外で両方を取らない）。
+	pubMu sync.Mutex
 
 	mu       sync.Mutex
 	ports    []int
@@ -79,16 +94,29 @@ type shareController struct {
 	store    *viewStore
 	fwd      *serviceForwarder
 	tun      *Tunnel
+	// gate はセッション中 1 個の L7 統制層（bind で生成・-tunnel 無効時は nil）。稼働中の待受が
+	// このポインタを握るため、キー要求の切替は待受を張り替えずに効く。
+	gate *l7Gate
+
+	// save はメッシュ名ラベルと共有の選択をローカル設定へ書き出す関数（付録C.9 D-14）。
+	// nil なら保存しない（`-config=` で無効化した場合・ヘッドレス運用）。秘密は渡さない。
+	save func(clientconf.Config)
 }
 
 // newShareController は指定ラベルの共有コントローラを返す。セッション開始前に生成してよく、
 // セッション固有の依存（ゾーン・表示状態・接続・プラン）は bind で与える。
 // ルーム作成前は上限を無料プランの値に置く（プランはルーム作成時にサーバーが確定させるため）。
-func newShareController(label string) *shareController {
+//
+// ports は保存済み設定から復元した共有の選択（付録C.9 D-14。無ければ nil）。save は設定の
+// 保存関数（nil なら保存しない）。復元した選択が実際に貸し出されるのはルーム作成後（bind →
+// publish）で、その時点のプラン上限までが対象になる（超過分は選択として保持されるだけ）。
+func newShareController(label string, ports []int, save func(clientconf.Config)) *shareController {
 	return &shareController{
 		label:    label,
+		ports:    append([]int(nil), ports...),
 		maxPorts: plan.MustLookup(plan.Free).MaxSharedServices,
 		keys:     accesskey.New(),
+		save:     save,
 	}
 }
 
@@ -126,23 +154,37 @@ func (c *shareController) bind(sess shareSession) {
 	if !c.keysOK {
 		c.reqKey = false // プランが下がったらキー要求も落とす（フェイルセーフ）
 	}
-	// プランが確定した結果、選択済みのポートが上限を超えている場合は先頭から上限までに切り詰める
-	// （Candidates と同じ決定的な順序で残すため、超過分の切り捨ても決定的になる）。
-	if len(c.ports) > c.maxPorts {
-		slog.Warn("プランの同時共有サービス数を超えるため一部の選択を解除しました",
-			"tier", spec.Tier, "max", c.maxPorts, "selected", len(c.ports))
-		c.ports = c.ports[:c.maxPorts]
+	// L7 統制はセッション中 1 個のゲートで行う。計上先（Recorder）は仮想NIC が持つため、
+	// -tunnel 無効時は統制も計上もできない。
+	c.gate = nil
+	if sess.tun != nil {
+		c.gate = &l7Gate{keys: c.keys, rec: sess.tun.Usage(), now: time.Now}
+		c.gate.setRequireKey(c.reqKey)
 	}
+	selected := len(c.ports)
 	c.mu.Unlock()
+	// 選択がプランの同時共有サービス数を超える場合、実際に貸すのは先頭から上限までになる
+	// （切り詰めは advert が決定的に行う）。選択そのものは保持し、上位プランのセッションでは元へ戻る
+	// ——保存済みの選択（付録C.9 D-14）を無料プランのセッション 1 回で恒久的に失わせないため。
+	if selected > spec.MaxSharedServices {
+		slog.Warn("プランの同時共有サービス数を超えるため一部の共有を見送ります（選択は保持します）",
+			"tier", spec.Tier, "max", spec.MaxSharedServices, "selected", selected)
+	}
 	c.publish()
 }
 
 // reset はセッション終了後に共有状態を初期化する（GUI がプロセス常駐のまま次のセッションを
-// 始めるため、前セッションの IP・接続を引きずらない）。共有するポートの選択も持ち越さない。
+// 始めるため、前セッションの IP・接続・発行済みキー・プランを引きずらない）。
+//
+// メッシュ名ラベルと共有するポートの選択は**持ち越す**（付録C.9 D-14）。ゲストは
+// `http://ollama.tanaka.mesh:11434` を手順書へ書くため、セッションをまたいで名前と貸し出し内容が
+// 安定していることに価値がある（要件 §4.6.2）。実際に貸し出されるのは次のルーム作成後
+// （bind → publish）で、その時点のプラン上限までが対象になる。
 func (c *shareController) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.ports, c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd, c.tun = nil, netip.Addr{}, "", nil, "", nil, nil, nil, nil
+	c.addr, c.endpoint, c.client, c.pubKey, c.zone, c.store, c.fwd, c.tun = netip.Addr{}, "", nil, "", nil, nil, nil, nil
+	c.gate = nil
 	free := plan.MustLookup(plan.Free)
 	c.maxPorts, c.usageOK, c.keysOK, c.limitsOK = free.MaxSharedServices, free.UsageRecords, free.AccessKeys, free.GuestLimits
 	c.reqKey = false
@@ -152,20 +194,107 @@ func (c *shareController) reset() {
 // setPorts は共有するポート集合を設定し、名前配布と表示へ反映する。共有の実行はホストの明示的な
 // 選択によるという要件（§4.6.1）に対応する唯一の入口。ポートや名前が不正なら何も変更しない。
 func (c *shareController) setPorts(ports []int) error {
-	// 反映前に妥当性を確認する（範囲外ポート・名前数の上限超過をここで弾く）。
+	if err := c.storePorts(ports); err != nil {
+		return err
+	}
+	c.publish()
+	c.persist() // 次回起動でも同じサービスを貸せるようにする（付録C.9 D-14）
+	return nil
+}
+
+// storePorts は選択を検証して保持する（反映は呼び出し側の publish / persist が行う）。
+// 検証と反映を同じ臨界区間に収めるためロック下で両方を行う（ラベルは setLabel と同時に
+// 触られうるため、ここで読む必要がある）。
+func (c *shareController) storePorts(ports []int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 範囲外ポート・名前数の上限超過をここで弾く。
 	if _, _, err := localsvc.Advertise(c.label, ports); err != nil {
 		return err
 	}
-	c.mu.Lock()
 	if len(ports) > c.maxPorts {
-		limit := c.maxPorts
-		c.mu.Unlock()
-		return fmt.Errorf("同時に共有できるサービスは %d 件までです（選択 %d 件）: %w", limit, len(ports), errShareLimit)
+		return fmt.Errorf("同時に共有できるサービスは %d 件までです（選択 %d 件）: %w", c.maxPorts, len(ports), errShareLimit)
 	}
 	c.ports = append([]int(nil), ports...)
+	return nil
+}
+
+// shareSnapshot は publish が 1 回のロックで取り出す状態一式。取得と適用を分ける以上、
+// 適用に使う値は同じ瞬間のものでなければならない（ラベルと選択が別の瞬間の組み合わせになると、
+// 配る名前と開く待受が食い違う）。
+type shareSnapshot struct {
+	addr     netip.Addr
+	zone     *meshname.Zone
+	store    *viewStore
+	client   *signalclient.Client
+	pubKey   string
+	endpoint string
+	fwd      *serviceForwarder
+	tun      *Tunnel
+	gate     *l7Gate
+	names    []string
+	svcs     []signaling.SharedService
+}
+
+// snapshotLocked は現在の状態と、そこから組み立てた広告を返す（呼び出し側でロック済みであること）。
+func (c *shareController) snapshotLocked() shareSnapshot {
+	s := shareSnapshot{
+		addr: c.addr, zone: c.zone, store: c.store, client: c.client,
+		pubKey: c.pubKey, endpoint: c.endpoint, fwd: c.fwd, tun: c.tun,
+		gate: c.gateLocked(),
+	}
+	s.names, s.svcs = c.advertLocked()
+	return s
+}
+
+// setLabel はメッシュ名に使うホストラベルを変更する（GUI の「名前を保存」・付録C.9 D-14）。
+// 入力は meshname.Sanitize で LDH ラベルへ落とすため "Tanaka Note" → "tanaka-note" のように
+// 受け付けるが、ラベルとして成立しない入力（英数字を含まない等）は errInvalidMeshLabel で拒む。
+//
+// セッション中の変更も許す。ゾーン・表示・広告へ即座に反映され、以前の名前は解決しなくなる
+// （ゲストへ配った URL は貼り替えが必要）。名前は自己申告であり信頼の根拠ではないため
+// （§4.6.3）、変更に承認は要らない。
+func (c *shareController) setLabel(label string) error {
+	l := meshname.Sanitize(label)
+	if err := meshname.ValidateLabel(l); err != nil {
+		return fmt.Errorf("メッシュ名 %q は使えません（英小文字・数字・ハイフン）: %w", label, errInvalidMeshLabel)
+	}
+	c.mu.Lock()
+	c.label = l
 	c.mu.Unlock()
 	c.publish()
+	c.persist()
 	return nil
+}
+
+// persist は現在の表示設定（メッシュ名ラベルと共有の選択）をローカル設定へ書き出す。
+// 保存関数が無ければ何もしない。渡すのは pkg/clientconf.Config だけであり、秘密鍵・招待トークン・
+// アクセスキーは構造上ここへ載らない（設計原則3）。
+func (c *shareController) persist() {
+	c.mu.Lock()
+	save, conf := c.save, clientconf.Config{MeshLabel: c.label, SharedPorts: append([]int(nil), c.ports...)}
+	c.mu.Unlock()
+	if save == nil {
+		return
+	}
+	save(conf)
+}
+
+// settingsView はローカル設定の表示状態（GUI 向け）。秘密は含まない。
+type settingsView struct {
+	MeshLabel string `json:"meshLabel"` // メッシュ名に使うホストラベル（例 "tanaka"）
+	MeshName  string `json:"meshName"`  // 組み上がったホスト名（例 "tanaka.mesh"）
+	Ports     []int  `json:"ports"`     // 共有するポートの選択（保存対象）
+	Persisted bool   `json:"persisted"` // 設定がこの端末へ保存されるか（-config で無効化できる）
+}
+
+// settings は現在のローカル設定を返す（GUI の GET /api/config）。
+func (c *shareController) settings() settingsView {
+	c.mu.Lock()
+	label, ports, save := c.label, append([]int{}, c.ports...), c.save
+	c.mu.Unlock()
+	name, _ := meshname.FQDN(label) // ラベルは常に検証済みのため失敗しない（失敗時は空表示）
+	return settingsView{MeshLabel: label, MeshName: name, Ports: ports, Persisted: save != nil}
 }
 
 // usageRecords は共有サービスの利用記録（要件 §4.7）を返す。閲覧できないプラン、または
@@ -195,8 +324,18 @@ func (c *shareController) setEndpoint(ep string) {
 // 空を返し、広告なしの peer_info（従来どおりのエンドポイント交換）に落とす。
 func (c *shareController) advert() ([]string, []signaling.SharedService) {
 	c.mu.Lock()
-	label, ports := c.label, append([]int(nil), c.ports...)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	return c.advertLocked()
+}
+
+// advertLocked は広告を組み立てる（呼び出し側でロック済みであること）。
+func (c *shareController) advertLocked() ([]string, []signaling.SharedService) {
+	label, ports := c.label, c.ports
+	// プラン上限を超える選択は先頭から上限までを貸す（順序は Candidates と同じ規則で決まるため
+	// 超過分の切り捨ても決定的）。選択自体は減らさない（bind のコメント参照）。
+	if len(ports) > c.maxPorts {
+		ports = ports[:c.maxPorts]
+	}
 
 	names, shared, err := localsvc.Advertise(label, ports)
 	if err != nil {
@@ -210,87 +349,78 @@ func (c *shareController) advert() ([]string, []signaling.SharedService) {
 	return names, svcs
 }
 
-// publish は現在の共有内容を Zone・表示状態・ピアへ反映する。ルーム作成前（addr 未確定）は
-// 何もしない（bind 時に改めて反映される）。
+// publish は現在の共有内容を Zone・転送・到達制御・表示状態・ピアへ反映する。ルーム作成前
+// （addr 未確定）は何もしない（bind 時に改めて反映される）。
+//
+// pubMu で直列化するため、GUI の操作が並行しても適用の順序は入れ替わらない。最後に走る publish は
+// 直近の状態（ラベル・選択）を取ってから適用するので、外れたポートの待受が残ることはない。
 func (c *shareController) publish() {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
-	addr, zone, store, client, pubKey, endpoint, fwd, tunl := c.addr, c.zone, c.store, c.client, c.pubKey, c.endpoint, c.fwd, c.tun
-	gate := c.gateLocked()
+	s := c.snapshotLocked()
 	c.mu.Unlock()
-	if !addr.IsValid() {
+	if !s.addr.IsValid() {
 		return
 	}
 
-	names, svcs := c.advert()
 	// 共有中サービスへの転送を差分適用する。127.0.0.1 バインドのサービスへゲストが到達できる
 	// ようにするための必須部品で（付録C.9 D-10）、共有から外れたポートは直ちに解放される。
-	ports := make([]int, 0, len(svcs))
-	for _, sv := range svcs {
+	ports := make([]int, 0, len(s.svcs))
+	for _, sv := range s.svcs {
 		ports = append(ports, sv.Port)
 	}
-	fwd.setGate(gate)
-	fwd.apply(ports)
+	s.fwd.setGate(s.gate)
+	s.fwd.apply(ports)
 	// 到達制御へも同じ集合を反映する。選ばれていないポートへの新規接続はここで落ちる（D-11）。
-	if tunl != nil {
-		tunl.SetSharedPorts(addr, ports)
+	if s.tun != nil {
+		s.tun.SetSharedPorts(s.addr, ports)
 	}
-	if zone != nil {
+	if s.zone != nil {
 		// 自身の名前も自分のゾーンへ入れる（ホストの画面に出す URL をホスト自身でも検証できる）。
-		if err := zone.Replace(addr, names); err != nil {
+		if err := s.zone.Replace(s.addr, s.names); err != nil {
 			slog.Warn("メッシュ名の登録に失敗しました", "err", err)
 		}
 	}
-	if store != nil {
-		list := make([]appstate.SharedService, 0, len(svcs))
-		for _, s := range svcs {
-			label, _ := localsvc.LabelFor(s.Port)
-			list = append(list, appstate.SharedService{Port: s.Port, Label: label, Name: s.Name, Addr: addr.String()})
+	if s.store != nil {
+		list := make([]appstate.SharedService, 0, len(s.svcs))
+		for _, sv := range s.svcs {
+			label, _ := localsvc.LabelFor(sv.Port)
+			list = append(list, appstate.SharedService{Port: sv.Port, Label: label, Name: sv.Name, Addr: s.addr.String()})
 		}
 		hostName := ""
-		if len(names) > 0 {
-			hostName = names[0] // Advertise の先頭はホスト自身の名前
+		if len(s.names) > 0 {
+			hostName = s.names[0] // Advertise の先頭はホスト自身の名前
 		}
-		store.update(func(m *appstate.Model) {
+		s.store.update(func(m *appstate.Model) {
 			m.SetMeshName(hostName)
 			_ = m.SetShared(list)
 		})
 	}
 	// 承認済みゲストへ再広告する。WAN エンドポイントが未確定（STUN 無効 / 未実行）の場合は
 	// peer_info を組めないため送らない。次にエンドポイントが確定した広告時に相乗りする。
-	if client == nil || endpoint == "" {
+	if s.client == nil || s.endpoint == "" {
 		return
 	}
-	if err := client.SendPeerInfo(pubKey, endpoint, names, svcs); err != nil {
+	if err := s.client.SendPeerInfo(s.pubKey, s.endpoint, s.names, s.svcs); err != nil {
 		slog.Warn("共有内容の再広告に失敗しました", "err", err)
 	}
 }
 
-// gateLocked は現在の設定に応じた L7 ゲートを返す（呼び出し側でロック済みであること）。
-// キーを要求しない場合でも、上限が設定されていれば HTTP で数えるためゲートを立てる。
-// 到達制御（L4）のみで足りる場合は nil を返し、生 TCP 転送のままにする。
+// gateLocked は L7 ゲートを立てるべきかを判定し、立てるなら長命なゲートを返す（呼び出し側で
+// ロック済みであること）。キーを要求しない場合でも、上限が設定されていれば HTTP で数えるため
+// 立てる。到達制御（L4）のみで足りる場合は nil を返し、生 TCP 転送のままにする。
+//
+// 返すのは常に同じ 1 個のゲート（bind で生成）。設定の変更はゲート自身が抱えるため、待受を
+// 張り替えなくても各リクエストが現在値を読む。
 func (c *shareController) gateLocked() *l7Gate {
-	if c.tun == nil || (!c.reqKey && !c.limitsOK) {
+	if c.gate == nil {
+		return nil // 仮想NIC が無い（-tunnel 無効）＝計上も統制もできない
+	}
+	if !c.reqKey && !c.gate.rec.HasLimits() {
 		return nil
 	}
-	if !c.reqKey && !c.hasLimitsLocked() {
-		return nil
-	}
-	return &l7Gate{keys: c.keys, rec: c.tun.Usage(), now: time.Now, requireKey: c.reqKey}
-}
-
-// hasLimitsLocked はいずれかのゲストに上限が設定されているかを返す。
-func (c *shareController) hasLimitsLocked() bool {
-	if c.tun == nil || c.store == nil {
-		return false
-	}
-	for _, g := range c.store.snapshot().Guests {
-		if addr, err := netip.ParseAddr(g.AssignedIP); err == nil {
-			if l := c.tun.Usage().LimitFor(addr); l.MaxBytes > 0 || l.MaxRequests > 0 {
-				return true
-			}
-		}
-	}
-	return false
+	return c.gate
 }
 
 // setRequireKey は共有サービスへアクセスキーを要求するかを切り替える（有料プラン機能）。
@@ -301,8 +431,11 @@ func (c *shareController) setRequireKey(on bool) error {
 		return errControlPlan
 	}
 	c.reqKey = on
+	gate := c.gate
 	c.mu.Unlock()
-	c.publish() // 待受を張り替える（生 TCP 転送 ⇄ HTTP プロキシ）
+	// 稼働中の待受にも即座に効かせる（ゲートは長命なので張り替えは不要）。
+	gate.setRequireKey(on)
+	c.publish() // 生 TCP 転送 ⇄ HTTP プロキシの切り替えが要る場合はここで張り替わる
 	return nil
 }
 
@@ -353,22 +486,20 @@ func (c *shareController) control() controlView {
 	c.mu.Lock()
 	available, reqKey, keys := c.keysOK, c.reqKey, c.keys
 	c.mu.Unlock()
-	m := make(map[string]string)
-	for _, g := range keys.Guests() {
-		if k, ok := keys.KeyFor(g); ok {
-			m[g] = k
-		}
-	}
-	return controlView{Available: available, RequireKey: reqKey, Keys: m}
+	return controlView{Available: available, RequireKey: reqKey, Keys: keys.Snapshot()}
 }
 
 // applyPeerAdvert は受信した peer_info の広告をローカルへ取り込む。peerIP は送信元ピアの
-// メッシュIP。display が真なら共有中サービスの表示（ゲスト画面）も更新する。
+// メッシュIP。
+//
+// store が非 nil なら共有中サービスの表示も更新する（借りる側＝ゲストのみ。ホストは自分が貸して
+// いる内容を出すため、ゲストの広告で表示を書き換えない）。lp が非 nil ならゲスト側 loopback
+// プロキシ（§4.6.4）の待受も広告へ合わせ、実際の待受ポートを表示へ載せる。
 //
 // 名前は相手の自己申告であり、別人が同じ名前を名乗りうる。Zone は先着優先で衝突を拒否し、
 // ここでは pkg/meshname による構文検証を通してから取り込む。信頼の根拠は名前ではなく
 // 公開鍵の帯域外照合（SAS）である（要件 §4.6.3）。
-func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, display bool) {
+func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi signaling.PeerInfo, lp *loopbackProxy) {
 	addr, err := netip.ParseAddr(peerIP)
 	if err != nil {
 		return
@@ -380,7 +511,7 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 		slog.Warn("ピアの名前を取り込めませんでした", "peer_ip", peerIP, "err", err)
 		return
 	}
-	if !display {
+	if store == nil {
 		return
 	}
 
@@ -398,6 +529,9 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 		label, _ := localsvc.LabelFor(s.Port)
 		list = append(list, appstate.SharedService{Port: s.Port, Label: label, Name: name, Addr: peerIP})
 	}
+	// ゲスト側 loopback プロキシ（副の経路・§4.6.4）を広告へ合わせ、実際の待受ポートを表示へ載せる。
+	// 共有から外れたサービスの待受はここで直ちに閉じられる（apply が差分適用する）。
+	applyLoopback(lp, list)
 	hostName := ""
 	if len(pi.Names) > 0 {
 		hostName = meshname.Normalize(pi.Names[0]) // 送信側 Advertise の先頭はピア自身の名前
@@ -410,3 +544,4 @@ func applyPeerAdvert(zone *meshname.Zone, store *viewStore, peerIP string, pi si
 		slog.Info("共有サービスの広告を受信しました", "count", len(list), "host_name", hostName)
 	}
 }
+

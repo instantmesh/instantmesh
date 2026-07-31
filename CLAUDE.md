@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 InstantMesh は、**手元のローカルAI（ローカルLLM／MCP サーバー／開発サーバー）を、公開URLを発行せずに特定の相手へ一時的に貸し出すためのアクセス層**。基盤はアカウント登録不要・使い終われば自動消滅するエフェメラルな Mesh VPN（WireGuard ベースの E2E 暗号化 P2P ネットワーク）で、その上に「共有するサービスを選んで貸す」導線（要件 §4.6）と「誰にどれだけ貸したかを制御・記録する」層（§4.7）を載せる。フェーズ1（Windows/macOS/Linux デスクトップ）を実装中。全体像・要件は `README.md` と `docs/`、進捗の詳細は `TODO.md` が正。
 
-> **2026-07-27 方向転換**: 前面を「汎用の一時メッシュVPN」から上記へ寄せた。汎用メッシュ機能（任意ポート・汎用ルーム）は削らず土台として残す。判断の根拠・却下した代替案・残存リスクは `docs/要件定義書.md` **付録C** が正。共有層は §4.6.1（サービス検出）・§4.6.3（名前解決）まで実装済みで、§4.6.4（loopback プロキシ）と §4.7（統制）は**未実装**。
+> **2026-07-27 方向転換**: 前面を「汎用の一時メッシュVPN」から上記へ寄せた。汎用メッシュ機能（任意ポート・汎用ルーム）は削らず土台として残す。判断の根拠・却下した代替案・残存リスクは `docs/要件定義書.md` **付録C** が正。共有層は §4.6（サービス検出・名前解決・loopback プロキシ）と §4.7（統制）まで実装済みで、**残るのは実機検証**（`docs/実機検証チェックリスト.md`）と GUI 第一画面の組み替え（§3.1）。
 
 ## 検証・ビルドのワークフロー（重要）
 
 **このマシンにはローカル Go がある**（`C:\Program Files\Go`・`go version` で確認）。`go build` / `go vet` / `go test` / `go mod tidy` はローカルで実行でき、変更の**高速な事前確認**に使ってよい。ただし**合否判定は CI（GitHub Actions）が正**：`pkg/` 100% カバレッジ強制・`govulncheck`・クロスビルドなどは CI が最終判断する。コードを変更したら push して CI の結果を `gh run list` / `gh run view` で確認するのが引き続き標準フロー（ローカルの成功だけで「通った」と判断しない）。
+
+> **`go test -race` はこのマシンでは実行できない**（C コンパイラが無く `-race requires cgo` / `cgo: C compiler "gcc" not found` で失敗する）。したがって**データ競合を検出できるのは CI だけ**で、ローカルの `go test` 成功はその保証を含まない。並行処理（ゴルーチン間で共有する変数・テスト内のクロージャを含む）に触れた変更は、push して CI の `Test (race + coverage)` を通るまで完了とみなさない。
 
 > 注: 他の開発者や CI ランナーの環境には Go が無い前提の記述が本ドキュメントに残っている場合がある。ローカル実行はこのマシン固有の補助手段であり、CI 中心のワークフローが正であることは変わらない。
 
@@ -44,9 +46,11 @@ go run ./cmd/client -mode host  -server ws://localhost:8080/ws -cognito-domain= 
 
 # ゲスト（ヘッドレス CLI。招待リンクから参加 → 帯域外MITM照合）
 go run ./cmd/client -mode guest -invite "instantmesh://join?..." -nick alice  # -tunnel/-stun 既定有効
+# 借りたサービスを自分の 127.0.0.1 へ出す（副の到達手段・§4.6.4。既定は無効）
+go run ./cmd/client -mode guest -loopback -invite "instantmesh://join?..." -nick alice
 ```
 
-`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（既定は OS のホスト名から導出）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
+`-dns` は共有サービスの名前解決（`.mesh` のローカルレスポンダ＋OS への split DNS 注入）を有効にする（**既定 true**・要 `-tunnel` と管理者権限）。`-mesh-name` は名前に使うラベル（優先順位は `-mesh-name` > 保存済み設定 > OS のホスト名）。`-config` はローカル設定（メッシュ名ラベル・共有するサービスの選択）の保存先（既定は OS のユーザ設定ディレクトリの `InstantMesh/config.json`・空文字で読み込みも保存も無効。**秘密鍵・招待トークン・アクセスキーは保存しない**・付録C.9 D-14）。`-loopback` は借りたサービスをゲストの `127.0.0.1` へ出す副の到達手段（**既定 false**・要 `-tunnel`・TCP のみ・§4.6.4）。`-tunnel` は wireguard-go 仮想NICを起動する（**既定 true**・要管理者/root 権限。権限なしでシグナリングのみ確認するときは `-tunnel=false`）。`-stun` は STUN サーバー（**既定 `stun.l.google.com:19302`**・無効化は `-stun=`）で WAN マッピングを発見し `peer_info` を広告する。`-relay` は P2P 直通失敗時のリレー自動フォールバック（既定 true・要 `-tunnel`）。クライアントの既定は公開サーバー（`-server wss://s1.instantmesh.net/ws`）＋ Cognito 認証（`-cognito-domain`/`-cognito-client-id` に公開プール値が既定で入る）。ローカル検証時は上記のとおり `-server` を上書きし `-cognito-domain=` で Cognito を無効化する。
 
 ## アーキテクチャ
 
@@ -96,17 +100,17 @@ TTL・アイドル掃除・レート制限・接続状態機械など時間依�
 
 方向転換で追加された層。メッシュ到達性の上に「特定のローカルサービスを、相手の手元から扱える形で出す」導線を載せる。ゲストの到達経路は3つで、**(1) を主とする**。
 
-1. **名前解決（主・実装済み）** `http://ollama.tanaka.mesh:11434` … **権威はホスト、解決はローカル**。ホストが定義した名前⇄メッシュIPの写像を既存シグナリング（`pkg/signaling` の `PeerInfo.Names`/`Services`）で配布し、各クライアントが自プロセス内に持つレスポンダ（`cmd/client/meshdns.go`・自メッシュIP の `:53`）で即答する。名前空間と写像は `pkg/meshname`（`Zone`）、DNS メッセージの解析/応答組み立ては `pkg/dnsmsg`（`pkg/stun` と同じくソケットは持たない）。OS へは split DNS で当該サフィックスのみ注入（`cmd/client/dnsconfig_<os>.go`: Windows=NRPT／macOS=`/etc/resolver/`／Linux=systemd-resolved）。**`hosts` 書き換えとホスト側DNSサーバー方式は採用しない**（要件 付録C.4）。どのサービスを貸すかは `cmd/client/sharing.go` の `shareController`（GUI の `POST /api/share`）が持つ。
+1. **名前解決（主・実装済み）** `http://ollama.tanaka.mesh:11434` … **権威はホスト、解決はローカル**。ホストが定義した名前⇄メッシュIPの写像を既存シグナリング（`pkg/signaling` の `PeerInfo.Names`/`Services`）で配布し、各クライアントが自プロセス内に持つレスポンダ（`cmd/client/meshdns.go`・自メッシュIP の `:53`）で即答する。名前空間と写像は `pkg/meshname`（`Zone`）、DNS メッセージの解析/応答組み立ては `pkg/dnsmsg`（`pkg/stun` と同じくソケットは持たない）。OS へは split DNS で当該サフィックスのみ注入（`cmd/client/dnsconfig_<os>.go`: Windows=NRPT／macOS=`/etc/resolver/`／Linux=systemd-resolved）。**`hosts` 書き換えとホスト側DNSサーバー方式は採用しない**（要件 付録C.4）。どのサービスを貸すかは `cmd/client/sharing.go` の `shareController`（GUI の `POST /api/share`）が持つ。メッシュ名ラベルと共有の選択は**セッションをまたいで安定させる**ためローカル設定へ保存する（表現・正規化は `pkg/clientconf`、保存場所とファイル I/O は `cmd/client/clientconfig.go`・付録C.9 D-14）。
 2. **メッシュIP直接** `http://10.0.0.1:11434` … 既存の到達性。削らない。
 
 > **前提（付録C.9 D-10・実装済み）**: `127.0.0.1` バインドのサービスにはメッシュIP 宛のパケットが届かないため、上記 (1)(2) はホスト側のユーザ空間転送（メッシュIP:ポート → `localhost`:ポート・`cmd/client/svcforward.go`）が無いと成立しない。OS の DNAT は使わない。共有の選択は D-11（`cmd/client/tunfilter.go` が `tun.Device` を包み、共有していない宛先への**新規接続**を落とす）により到達制御として効く。ICMP と自メッシュIP の `:53` は常に通す。同じ地点でゲスト別・共有別の通信量を計上する（`pkg/usage`・閲覧は Pro 限定）。切り分け用の無効化は `-share-guard=false`。
-3. **loopback プロキシ（副）** `http://127.0.0.1:11434` … OS の DNS を触れない環境向けの代替。**TCP のみ**。衝突時の代替ポートは決定的に導出する（ランダム割当は不可）。
+3. **loopback プロキシ（副・実装済み）** `http://127.0.0.1:11434` … OS の DNS を触れない環境向けの代替。`-loopback` で明示的に有効化する（**既定 false**・要 `-tunnel`）。**TCP のみ**・ゲスト側は `127.0.0.1` 限定 bind。ポート写像は `pkg/portmap`（元ポートを保存し、埋まっていれば `20000 + SHA256(ホスト公開鍵 ‖ 元ポート) mod 10000` へ**決定的に**退避 → 線形探索。ランダム割当は不可）、待受の駆動は `cmd/client/loopback.go`。空きの判定は実際の bind 試行で行い、実待受ポートは `appstate.SharedService.Local` 経由で GUI に明示する。**待受の集合管理（差分適用・即時解放・全解放）はホスト側フォワーダと共通の `cmd/client/listenerset.go`（`listenerSet`）** で、両者が与えるのは「待受をどう開くか」だけ。
 
 実装時の必須事項: split DNS の**起動時残骸回収**（実装済み: `cleanupStaleSplitDNS`）、当該サフィックス**以外のクエリ経路を変更しない**スコープ厳守、プロキシの**即時解放**（ホストが元ポートを占有し続けるとゲストが自分の同種サービスを起動できない）、ホスト側サービスに `0.0.0.0` バインドを要求しないこと。名前は自己申告であり、信頼の根拠は SAS による公開鍵の帯域外照合であること（UI にも明示する）。
 
 ### GUI（クライアントの LocalAPI 層）
 
-クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET /api/usage` は利用記録、`GET/POST /api/control` はアクセスキーと上限＝いずれも Pro 限定）。
+クライアントは既定で **GUI モード**（`-mode gui`）で起動する。`runGUI`（`cmd/client/guiserver.go`）が 127.0.0.1（既定 `:8088`・`-gui-addr`）に HTTP サーバーを立て、既定ブラウザで自動的に開く（`cmd/client/openbrowser.go`）。埋め込み SPA（`cmd/client/guiindex.go`・外部依存なしの自己完結 HTML/JS）が `GET /api/state` をポーリングして表示状態を購読し、`POST /api/{host,join,share,approve,reject,rotate,leave,reset}` で操作する（`GET /api/services` はローカルサービス検出、`POST /api/share` は貸すサービスの選択、`GET/POST /api/config` はローカル設定＝メッシュ名の編集と保存状態、`GET /api/usage` は利用記録、`GET/POST /api/control` はアクセスキーと上限＝後の 2 つは Pro 限定）。
 
 - **UI とコアの分離**: GUI とヘッドレス CLI（`-mode host`/`guest`）は同一の受信ループ（`runHost`/`runGuest`）を駆動する。表示状態は `pkg/appstate`（ゴルーチンセーフなビューモデル）に集約し、GUI・CLI とも購読する（設計原則1）。
 - **セキュリティ**: `/api/*` は `pkg/originguard` で同一オリジン以外（CSRF・DNS リバインディング）を fail-closed で 403。127.0.0.1 のみに bind し、WireGuard 秘密鍵などの復号鍵は API に一切載せない（配信は公開鍵・招待・表示メタデータのみ）。

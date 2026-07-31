@@ -43,7 +43,8 @@ func TestGateCheck(t *testing.T) {
 	rec := usage.New()
 	now := time.Now()
 	peer := netip.MustParseAddr("10.0.0.2")
-	g := &l7Gate{keys: keys, rec: rec, now: func() time.Time { return now }, requireKey: true}
+	g := &l7Gate{keys: keys, rec: rec, now: func() time.Time { return now }}
+	g.setRequireKey(true)
 
 	auth := http.Header{}
 	auth.Set("Authorization", "Bearer "+key)
@@ -74,16 +75,27 @@ func TestGateCheck(t *testing.T) {
 	}
 
 	// キーを要求しない設定なら、キー無しでも通る（上限だけを効かせる用途）。
-	g.requireKey = false
+	g.setRequireKey(false)
 	if v := g.check(other, 11434, http.Header{}); v.status != 0 {
 		t.Errorf("キー要求無効時に拒否された = %d", v.status)
 	}
 	// 失効させたキーは通らない。
-	g.requireKey = true
+	g.setRequireKey(true)
 	keys.Revoke("guest-pk")
 	if v := g.check(other, 11434, auth); v.status != http.StatusUnauthorized {
 		t.Errorf("失効後 = %d, want 401", v.status)
 	}
+}
+
+// testHTTPProxy は 127.0.0.1 の空きポートで待受を開き、gate を通した要求を target へ中継する
+// プロキシを返す（本番で待受を開くのは serviceForwarder.open だけなので、テスト側で bind する）。
+func testHTTPProxy(t *testing.T, target string, gate *l7Gate) *httpProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return newHTTPProxy(ln, target, 11434, gate)
 }
 
 // TestHTTPProxyEnforces は実 HTTP でキー要求と中継が機能することを確かめる。
@@ -100,13 +112,11 @@ func TestHTTPProxyEnforces(t *testing.T) {
 	keys := accesskey.New()
 	key, _ := keys.Issue("guest-pk")
 	rec := usage.New()
-	gate := &l7Gate{keys: keys, rec: rec, now: time.Now, requireKey: true}
+	gate := &l7Gate{keys: keys, rec: rec, now: time.Now}
+	gate.setRequireKey(true)
 
 	target := strings.TrimPrefix(upstream.URL, "http://")
-	p, err := startHTTPProxy(netip.MustParseAddrPort("127.0.0.1:0"), target, 11434, gate)
-	if err != nil {
-		t.Fatalf("startHTTPProxy: %v", err)
-	}
+	p := testHTTPProxy(t, target, gate)
 	defer p.close()
 
 	base := "http://" + p.addr().String()
@@ -148,6 +158,47 @@ func TestHTTPProxyEnforces(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Error("close 後も待受が解放されていない")
+}
+
+// TestHTTPProxyRequireKeyTakesEffectLive は、稼働中の待受を張り替えずにキー要求の切替が効く
+// ことを確かめる。ゲートは長命な 1 個で各リクエストが現在値を読むため、待受を開いたあとに
+// 設定を変えても反映される（張り替えに頼っていると反映されない）。
+func TestHTTPProxyRequireKeyTakesEffectLive(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	keys := accesskey.New()
+	rec := usage.New()
+	gate := &l7Gate{keys: keys, rec: rec, now: time.Now} // キー要求は無効で開始
+	p := testHTTPProxy(t, strings.TrimPrefix(upstream.URL, "http://"), gate)
+	defer p.close()
+
+	base := "http://" + p.addr().String() + "/api/tags"
+	status := func() int {
+		t.Helper()
+		res, err := http.Get(base)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer res.Body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		return res.StatusCode
+	}
+
+	if got := status(); got != http.StatusOK {
+		t.Fatalf("キー要求無効時 = %d, want 200", got)
+	}
+	// 待受はそのままでキー要求を有効化する。
+	gate.setRequireKey(true)
+	if got := status(); got != http.StatusUnauthorized {
+		t.Errorf("キー要求を有効化しても素通りした = %d, want 401", got)
+	}
+	gate.setRequireKey(false)
+	if got := status(); got != http.StatusOK {
+		t.Errorf("キー要求を戻しても拒否された = %d, want 200", got)
+	}
 }
 
 func TestPeerAddr(t *testing.T) {

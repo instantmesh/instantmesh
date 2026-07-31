@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/invite"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
 	"github.com/instantmesh/instantmesh/pkg/meshpeer"
@@ -78,9 +79,11 @@ func main() {
 	cognitoDomain := flag.String("cognito-domain", "https://instantmesh-net.auth.ap-northeast-1.amazoncognito.com", "Cognito Hosted UI ベース URL。既定は公開サーバーのユーザープール。ホストは PKCE サインインで ID トークンを取得する。ローカルの DevAuthenticator サーバーに繋ぐ場合は空文字を指定して無効化する（その場合は -account を Bearer に使用）")
 	cognitoClientID := flag.String("cognito-client-id", "1mhe007gbarnh3u2f0dkglm8ep", "Cognito アプリクライアント ID（公開クライアント・シークレット無し）。既定は公開サーバーのアプリクライアント")
 	cognitoScope := flag.String("cognito-scope", "openid", "要求スコープ（カンマ区切り）")
-	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	meshName := flag.String("mesh-name", "", "メッシュ名に使うラベル（既定: 保存済み設定 → OS のホスト名から導出）。ゲストは http://<ラベル>.mesh:<ポート> で共有サービスへ到達する")
+	configPath := flag.String("config", defaultConfigPath(), "ローカル設定（メッシュ名・共有するサービスの選択）の保存先。空文字を指定すると読み込みも保存もしない。秘密鍵・招待トークン・アクセスキーは保存しない")
 	shareGuard := flag.Bool("share-guard", true, "共有していないサービスへのメッシュ越しの到達を遮断する（要 -tunnel）。ICMP と名前解決は常に通す。切り分け用に無効化できる")
 	useDNS := flag.Bool("dns", true, "共有サービスへ名前で到達できるようにする（.mesh のローカル解決＋OS への split DNS 注入。要 -tunnel・管理者権限）")
+	loopback := flag.Bool("loopback", false, "借りたサービスを自分の 127.0.0.1 の同じポートへ出す（副の到達手段。OS の DNS を触れない環境向け・TCP のみ・要 -tunnel）。ポートが埋まっていれば決定的に導出した代替ポートへ退避する")
 	flag.Parse()
 
 	// 前回の異常終了で OS に残った split DNS 設定を起動時に無条件回収する（要件 §4.6.3）。
@@ -95,6 +98,20 @@ func main() {
 		scopes:      splitScopes(*cognitoScope),
 	}
 
+	// ローカル設定（メッシュ名ラベル・共有の選択）を読む（付録C.9 D-14）。読めなくても既定値で
+	// 続行する。ただし自身より新しい形式だった場合は保存を止め、新しいクライアントの設定を
+	// 上書きで壊さないようにする。
+	conf, cerr := loadClientConfig(*configPath)
+	savePath := *configPath
+	if cerr != nil {
+		slog.Warn("クライアント設定を読み込めませんでした（既定値で続行します）", "path", *configPath, "err", cerr)
+		if errors.Is(cerr, clientconf.ErrUnsupportedVersion) {
+			savePath = ""
+		}
+	}
+	// メッシュ名ラベルの優先順位: -mesh-name > 保存済み設定 > OS のホスト名 > "host"。
+	meshLabel := meshHostLabel(*meshName, conf.MeshLabel)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -105,14 +122,14 @@ func main() {
 			server: *server, account: *account, durationSec: *duration,
 			auto: *auto, useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr,
 			relay: *relay, stdinConsole: true, cognito: cognito,
-			meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
+			meshName: meshLabel, useDNS: *useDNS, shareGuard: *shareGuard,
 		}
 		err = runHost(ctx, cfg, newViewStore(), nil)
 	case "guest":
 		cfg := guestConfig{
 			inviteURL: *inviteURL, nick: *nick, useTunnel: *useTunnel,
 			ifname: *ifname, stunAddr: *stunAddr, relay: *relay, useDNS: *useDNS,
-			shareGuard: *shareGuard,
+			shareGuard: *shareGuard, loopback: *loopback,
 		}
 		err = runGuest(ctx, cfg, newViewStore(), nil)
 	case "gui":
@@ -120,7 +137,10 @@ func main() {
 		opts := guiOptions{
 			server: *server, account: *account, duration: *duration,
 			useTunnel: *useTunnel, ifname: *ifname, stunAddr: *stunAddr, relay: *relay,
-			cognito: cognito, meshName: *meshName, useDNS: *useDNS, shareGuard: *shareGuard,
+			cognito: cognito, meshName: meshLabel, useDNS: *useDNS, shareGuard: *shareGuard,
+			loopback: *loopback,
+			// 保存済みの共有の選択を復元し、以後の変更は同じ場所へ書き戻す（付録C.9 D-14）。
+			sharedPorts: conf.SharedPorts, saveConf: configSaver(savePath),
 		}
 		err = runGUI(ctx, *guiAddr, opts)
 	default:
@@ -239,7 +259,9 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 	zone := meshname.NewZone()
 	share := cfg.share
 	if share == nil {
-		share = newShareController(meshHostLabel(cfg.meshName))
+		// ヘッドレス運用（-mode host）。共有を選ぶ導線が無いため共有なしで開始し、選択の保存も
+		// しない（メッシュ名ラベルは保存済み設定を含めて main が解決済み・付録C.9 D-14）。
+		share = newShareController(meshHostLabel(cfg.meshName), nil, nil)
 	}
 	var nameRes *nameResolution
 	defer func() { nameRes.stop() }()
@@ -326,8 +348,8 @@ func runHost(ctx context.Context, cfg hostConfig, store *viewStore, onClient fun
 			slog.Info("ピア情報受信", "pubkey", pi.PubKey, "endpoint", pi.WANEndpoint)
 			if ip, ok := store.guestIP(pi.PubKey); ok {
 				// ゲストが名前を広告してきた場合はゾーンへ取り込む（表示は貸す側＝ホストの
-				// 共有内容を出すため更新しない）。
-				applyPeerAdvert(zone, store, ip, pi, false)
+				// 共有内容を出すため更新しない。loopback プロキシは借りる側の手段なので使わない）。
+				applyPeerAdvert(zone, nil, ip, pi, nil)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.HostPeer(pi.PubKey, ip, endpoint)
 				}
@@ -376,6 +398,7 @@ type guestConfig struct {
 	relay            bool
 	useDNS           bool // ホストが広告した名前で共有サービスへ到達できるようにする
 	shareGuard       bool // 自分宛の新規接続を落とす（借りる側の端末を開かせない・付録C.9 D-11）
+	loopback         bool // 共有サービスを自分の 127.0.0.1 へ出す（副の到達手段・§4.6.4）
 }
 
 // runGuest はゲストとして招待リンクから参加を申請し、承認・ピア構成を処理する。
@@ -437,6 +460,10 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 	zone := meshname.NewZone()
 	var nameRes *nameResolution
 	defer func() { nameRes.stop() }()
+	// ゲスト側 loopback プロキシ（副の経路・§4.6.4）。承認後（ホストのメッシュIP 確定後）に生成し、
+	// 退出・解散・時間切れ・プロセス終了のいずれでも待受を直ちに閉じる。
+	var lp *loopbackProxy
+	defer func() { lp.closeAll() }()
 	for {
 		env, err := c.Next()
 		if err != nil {
@@ -469,6 +496,10 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 					tun.SetSharedPorts(addr, nil)
 				}
 			}
+			// loopback プロキシ（§4.6.4）。ホストのメッシュIP が確定したので生成できる。待受は
+			// 続く peer_info（共有中サービスの広告）で開く。仮想NIC が無ければ転送先へ到達
+			// できないため起動しない。
+			lp = startLoopback(ctx, cfg.loopback && tun != nil, hostPubKey, ja.HostIP)
 			advertise(c, tun, cfg.stunAddr, pub, nil) // ホストへ自エンドポイントを広告（ゲストは名前を配らない）
 		case signaling.TypeJoinRejected:
 			var jr signaling.JoinRejected
@@ -488,8 +519,9 @@ func runGuest(ctx context.Context, cfg guestConfig, store *viewStore, onClient f
 			slog.Info("ピア情報受信", "pubkey", pi.PubKey, "endpoint", pi.WANEndpoint)
 			if pi.PubKey == hostPubKey {
 				// ホストが広告した名前と共有中サービスを取り込む（名前はホストの自己申告であり、
-				// 信頼の根拠は照合済みのホスト公開鍵の方である・§4.6.3）。
-				applyPeerAdvert(zone, store, hostIP, pi, true)
+				// 信頼の根拠は照合済みのホスト公開鍵の方である・§4.6.3）。loopback プロキシが
+				// 有効なら待受もここで広告へ追従する（共有停止で直ちに閉じる・§4.6.4）。
+				applyPeerAdvert(zone, store, hostIP, pi, lp)
 				build := func(endpoint string) (wgconf.Config, error) {
 					return meshpeer.GuestPeer(hostPubKey, hostIP, endpoint)
 				}

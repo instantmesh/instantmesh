@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/instantmesh/instantmesh/pkg/accesskey"
+	"github.com/instantmesh/instantmesh/pkg/usage"
 )
 
 // echoService は転送先に見立てたローカルサービス（受け取った行をそのまま返す）。
@@ -33,14 +36,22 @@ func echoService(t *testing.T) net.Listener {
 	return ln
 }
 
+// testForwarder は 127.0.0.1 の空きポートで待受を開き、target へ中継する転送を返す
+// （本番で待受を開くのは serviceForwarder.open だけなので、テスト側で bind する）。
+func testForwarder(t *testing.T, target string) *forwarder {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return newForwarder(ln, target, net.Dial)
+}
+
 // TestForwarderRelays は待受→転送先の双方向中継が成立することを確かめる
 // （ホスト側の「メッシュIP:ポート → 127.0.0.1:ポート」と同じ経路。要件 §4.6.2 の前提）。
 func TestForwarderRelays(t *testing.T) {
 	svc := echoService(t)
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), svc.Addr().String(), net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, svc.Addr().String())
 	defer f.close()
 
 	c, err := net.Dial("tcp", f.addr().String())
@@ -66,10 +77,7 @@ func TestForwarderRelays(t *testing.T) {
 // （ホストが元ポートを占有し続けないこと・要件 §4.6.4 の即時解放）。
 func TestForwarderCloseReleasesPort(t *testing.T) {
 	svc := echoService(t)
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), svc.Addr().String(), net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, svc.Addr().String())
 	addr := f.addr().String()
 	// 確立済み接続がある状態で閉じても、リスナーと接続の双方が解放される。
 	c, err := net.Dial("tcp", addr)
@@ -93,10 +101,7 @@ func TestForwarderTargetUnreachable(t *testing.T) {
 	target := dead.Addr().String()
 	_ = dead.Close()
 
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), target, net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, target)
 	defer f.close()
 
 	c, err := net.Dial("tcp", f.addr().String())
@@ -159,11 +164,51 @@ func TestServiceForwarderSkipsBoundPort(t *testing.T) {
 	sf.targetFor = func(int) string { return occupied.Addr().String() }
 	sf.apply([]int{port})
 
-	sf.mu.Lock()
-	active := len(sf.active)
-	sf.mu.Unlock()
-	if active != 0 {
-		t.Errorf("bind できないポートを転送対象にした: %d 件", active)
+	if _, ok := sf.set.listenerFor(port); ok {
+		t.Error("bind できないポートを転送対象にした")
+	}
+}
+
+// TestServiceForwarderSetGate は待受の性質が変わるとき（生 TCP 転送 ⇄ HTTP プロキシ）だけ
+// 張り替え、同じ性質のままなら継続中の待受を切らないことを確かめる。
+//
+// ゲートの設定変更（キー要求の切替）でここを通らないのは、l7Gate が長命な 1 個で各リクエストが
+// 現在値を読むため（張り替え不要）。その挙動は TestHTTPProxyRequireKeyTakesEffectLive が見る。
+func TestServiceForwarderSetGate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	svc := echoService(t)
+	sf := newServiceForwarder(ctx, netip.MustParseAddr("127.0.0.1"))
+	sf.targetFor = func(int) string { return svc.Addr().String() }
+
+	port := freePort(t)
+	sf.apply([]int{port})
+	first, ok := sf.set.listenerFor(port)
+	if !ok {
+		t.Fatal("待受が開いていない")
+	}
+
+	// 生 TCP 転送 → HTTP プロキシ。待受は閉じ、次の apply で開き直る。
+	gate := &l7Gate{keys: accesskey.New(), rec: usage.New(), now: time.Now}
+	sf.setGate(gate)
+	if _, ok := sf.set.listenerFor(port); ok {
+		t.Error("ゲート切替で待受が閉じていない")
+	}
+	sf.apply([]int{port})
+	second, ok := sf.set.listenerFor(port)
+	if !ok {
+		t.Fatal("張り替え後に待受が開いていない")
+	}
+	if second == first {
+		t.Error("HTTP プロキシへ張り替わっていない")
+	}
+
+	// 同じゲートを再設定しても張り替えない（継続中の接続を切らない）。
+	sf.setGate(gate)
+	again, ok := sf.set.listenerFor(port)
+	if !ok || again != second {
+		t.Error("性質が変わらないのに張り替えた")
 	}
 }
 
@@ -171,6 +216,7 @@ func TestServiceForwarderSkipsBoundPort(t *testing.T) {
 func TestServiceForwarderNilSafe(t *testing.T) {
 	var sf *serviceForwarder
 	sf.apply([]int{11434})
+	sf.setGate(nil)
 	sf.closeAll()
 }
 

@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/accesskey"
@@ -36,13 +37,27 @@ import (
 // クライアント向けの代替で、通常は Authorization を使う。
 const keyHeader = "X-InstantMesh-Key"
 
-// l7Gate は共有サービスへの HTTP リクエストを検査する。keys が nil ならキーを要求しない。
+// l7Gate は共有サービスへの HTTP リクエストを検査する。
+//
+// セッション中 1 個だけ生成して使い回す（shareController が保持）。稼働中の待受はこのポインタを
+// 握るため、キー要求の切替は requireKey を書き換えるだけで即座に効く——待受を張り替える必要は
+// ない。逆に「生 TCP 転送 ⇄ HTTP プロキシ」の切替は待受の性質そのものが変わるため張り替える。
 type l7Gate struct {
 	keys *accesskey.Registry
 	rec  *usage.Recorder
 	now  func() time.Time
-	// requireKey が真のときだけキーを要求する（有料プラン機能・§5）。
-	requireKey bool
+
+	// requireKey が真のときだけキーを要求する（有料プラン機能・§5）。GUI の操作ゴルーチンが
+	// 書き、各リクエストのゴルーチンが読むため atomic で扱う。
+	requireKey atomic.Bool
+}
+
+// setRequireKey はキー要求の有無を切り替える（g が nil なら何もしない）。
+func (g *l7Gate) setRequireKey(on bool) {
+	if g == nil {
+		return
+	}
+	g.requireKey.Store(on)
 }
 
 // verdict は 1 リクエストに対する判定。
@@ -54,18 +69,18 @@ type verdict struct {
 // check はリクエストの可否を判定し、通す場合はリクエスト数を計上する。
 // peer は接続元のメッシュIP、port は共有サービスのポート。
 func (g *l7Gate) check(peer netip.Addr, port uint16, header http.Header) verdict {
-	if g.requireKey {
+	if g.requireKey.Load() {
 		key := extractKey(header)
 		if _, ok := g.keys.Verify(key); !ok {
 			// キーの有無・誤りを区別せず同じ応答にする（存在探索の手がかりを与えない）。
 			return verdict{status: http.StatusUnauthorized, reason: "アクセスキーが必要です"}
 		}
 	}
-	// 上限に達したゲストだけを遮断する（ルーム全体には影響させない・§4.7）。
-	if g.rec.Exceeded(peer) {
+	// 上限に達したゲストだけを遮断する（ルーム全体には影響させない・§4.7）。判定と計上は
+	// AllowRequest が 1 つの臨界区間で行う（境界での取りこぼしを防ぐ）。
+	if !g.rec.AllowRequest(peer, port, g.now()) {
 		return verdict{status: http.StatusTooManyRequests, reason: "利用上限に達しました"}
 	}
-	g.rec.AddRequest(peer, port, g.now())
 	return verdict{}
 }
 
@@ -89,12 +104,12 @@ type httpProxy struct {
 	srv *http.Server
 }
 
-// startHTTPProxy は listen で待ち受け、gate を通した要求だけを target へ中継する。
-func startHTTPProxy(listen netip.AddrPort, target string, port uint16, gate *l7Gate) (*httpProxy, error) {
-	ln, err := net.Listen("tcp", listen.String())
-	if err != nil {
-		return nil, err
-	}
+// newHTTPProxy は ln で受けた要求を gate に通し、通ったものだけを target へ中継する。
+//
+// 待受は呼び出し側が開いてから渡す（生 TCP 転送の newForwarder と同じ形）。bind をここに持たない
+// のは、bind の失敗が「サービス自身が全アドレスで待ち受けている」ことの判別を兼ねており、その
+// 意味づけを待受を開く側（serviceForwarder.open）へ 1 箇所に寄せているため。
+func newHTTPProxy(ln net.Listener, target string, port uint16, gate *l7Gate) *httpProxy {
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(&url.URL{Scheme: "http", Host: target})
@@ -124,7 +139,7 @@ func startHTTPProxy(listen netip.AddrPort, target string, port uint16, gate *l7G
 	})
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
-	return &httpProxy{ln: ln, srv: srv}, nil
+	return &httpProxy{ln: ln, srv: srv}
 }
 
 // addr は実際の待受アドレスを返す。
@@ -153,3 +168,6 @@ func writeGateError(w http.ResponseWriter, status int, reason string) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": reason})
 }
+
+// （200 で返す場合は guiserver.go の writeJSON を使う。ここは WriteHeader でステータスを
+// 指定する必要があるため別に持つ。）

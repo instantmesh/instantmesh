@@ -439,9 +439,51 @@ func TestSetSharedAndMeshName(t *testing.T) {
 		t.Errorf("名前なしの URL = %+v", s.Shared[1])
 	}
 
+	// loopback プロキシを使わない場合は当該経路の URL を出さない（経路(3)は副の手段）。
+	if s.Shared[0].LocalURL != "" || s.Shared[0].LocalMoved {
+		t.Errorf("loopback 無効なのに経路(3)が出た: %+v", s.Shared[0])
+	}
+
 	// 空でも JSON で [] になるよう非 nil スライス。
 	if New().View().Shared == nil {
 		t.Error("空の Shared は非 nil であるべき（JSON []）")
+	}
+}
+
+// TestSharedLoopbackURL はゲスト側 loopback プロキシの到達 URL（要件 §4.6.2 経路(3)）が、
+// 実際の待受ポートで組み立てられることを確かめる。元ポートから退避した場合は LocalMoved が真に
+// なり、UI が「ポートが変わった」ことを明示できる（§4.6.4）。
+func TestSharedLoopbackURL(t *testing.T) {
+	m := waiting(t)
+	if err := m.Approved("10.9.0.2", "10.9.0.1"); err != nil {
+		t.Fatalf("Approved: %v", err)
+	}
+	if err := m.SetShared([]SharedService{
+		{Port: 11434, Label: "Ollama", Name: "ollama.tanaka.mesh", Addr: "10.9.0.1", Local: 11434},
+		{Port: 3000, Addr: "10.9.0.1", Local: 24242}, // 元ポートが埋まり代替へ退避
+		{Port: 8080, Addr: "10.9.0.1"},               // 待受を確保できなかった（Local=0）
+	}); err != nil {
+		t.Fatalf("SetShared: %v", err)
+	}
+
+	s := m.View()
+	if len(s.Shared) != 3 {
+		t.Fatalf("Shared = %+v", s.Shared)
+	}
+	// 元ポートを保てた場合。
+	if s.Shared[0].LocalURL != "http://127.0.0.1:11434" || s.Shared[0].LocalMoved {
+		t.Errorf("ポート保存 = %+v", s.Shared[0])
+	}
+	// 代替ポートへ退避した場合は実際の値を出し、退避を明示する。
+	if s.Shared[1].LocalURL != "http://127.0.0.1:24242" || !s.Shared[1].LocalMoved {
+		t.Errorf("退避 = %+v", s.Shared[1])
+	}
+	// 待受が無ければ経路(3)の URL は出さない（他の経路は使える）。
+	if s.Shared[2].LocalURL != "" || s.Shared[2].LocalMoved {
+		t.Errorf("待受なし = %+v", s.Shared[2])
+	}
+	if s.Shared[2].MeshURL != "http://10.9.0.1:8080" {
+		t.Errorf("待受なしでもメッシュIP 直接は出すべき: %+v", s.Shared[2])
 	}
 }
 

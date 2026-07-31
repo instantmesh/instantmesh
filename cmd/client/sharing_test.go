@@ -2,11 +2,14 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/meshname"
 	"github.com/instantmesh/instantmesh/pkg/plan"
@@ -31,6 +34,13 @@ func TestMeshHostLabel(t *testing.T) {
 	if got := meshHostLabel("日本語のみ"); got == "" {
 		t.Error("代替ラベルが空になった")
 	}
+	// 候補は優先順（-mesh-name > 保存済み設定）に評価し、使える最初のものを採る（付録C.9 D-14）。
+	if got := meshHostLabel("", "saved-label"); got != "saved-label" {
+		t.Errorf("保存済み設定 = %q, want saved-label", got)
+	}
+	if got := meshHostLabel("flag", "saved-label"); got != "flag" {
+		t.Errorf("フラグ優先 = %q, want flag", got)
+	}
 }
 
 // hostSession はホストのセッション相当（ゾーン・表示状態・フェイク接続）を組み立てる。
@@ -49,7 +59,7 @@ func hostSession(t *testing.T) (*meshname.Zone, *viewStore, *fakeConn, *signalcl
 // 反映されることを確かめる（要件 §4.6.1 / §4.6.3）。
 func TestShareControllerPublishes(t *testing.T) {
 	zone, store, fc, cl := hostSession(t)
-	c := newShareController("tanaka")
+	c := newShareController("tanaka", nil, nil)
 
 	// ルーム作成前の選択は保持だけされ、まだ配られない。
 	if err := c.setPorts([]int{11434}); err != nil {
@@ -126,7 +136,7 @@ func TestShareControllerPublishes(t *testing.T) {
 }
 
 func TestShareControllerRejectsInvalidPort(t *testing.T) {
-	c := newShareController("tanaka")
+	c := newShareController("tanaka", nil, nil)
 	if err := c.setPorts([]int{0}); !errors.Is(err, localsvc.ErrInvalidPort) {
 		t.Errorf("err = %v, want ErrInvalidPort", err)
 	}
@@ -137,20 +147,137 @@ func TestShareControllerRejectsInvalidPort(t *testing.T) {
 	}
 }
 
-// TestShareControllerReset は次のセッションへ前回の共有内容を持ち越さないことを確かめる。
+// TestShareControllerReset はセッション終了後の初期化で、セッション固有の状態（IP・接続・
+// 発行済みキー）は捨てる一方、メッシュ名と共有の選択は持ち越すことを確かめる（付録C.9 D-14）。
 func TestShareControllerReset(t *testing.T) {
-	zone, store, _, cl := hostSession(t)
-	c := newShareController("tanaka")
+	zone, store, fc, cl := hostSession(t)
+	c := newShareController("tanaka", nil, nil)
 	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: "free"})
+	c.setEndpoint("203.0.113.7:51820")
 	if err := c.setPorts([]int{11434}); err != nil {
 		t.Fatalf("setPorts: %v", err)
 	}
-	c.reset()
-	if names, svcs := c.advert(); len(names) != 1 || len(svcs) != 0 {
-		t.Errorf("reset 後: names = %v, services = %+v", names, svcs)
+	if _, err := c.issueKey("guestPK"); err == nil {
+		t.Error("無料プランでキーが発行された")
 	}
-	// bind 前に戻るため publish は何もしない（パニックしない）。
+	sentBefore := len(fc.sent())
+
+	c.reset()
+
+	// 選択とラベルは残る（次のルーム作成で改めて貸し出される）。
+	names, svcs := c.advert()
+	if len(names) != 2 || len(svcs) != 1 || svcs[0].Port != 11434 {
+		t.Errorf("reset 後: names = %v, services = %+v（選択は持ち越すべき）", names, svcs)
+	}
+	// セッション固有の状態は消えるため、publish は何も配らない（パニックもしない）。
 	c.publish()
+	if len(fc.sent()) != sentBefore {
+		t.Error("reset 後に前セッションの接続へ送信した")
+	}
+	if len(c.keys.Snapshot()) != 0 {
+		t.Error("発行済みキーが残っている")
+	}
+}
+
+// TestShareControllerSetLabel は GUI からのメッシュ名変更（付録C.9 D-14）が、ゾーン・表示・
+// 再広告へ反映され、ローカル設定へ保存されることを確かめる。
+func TestShareControllerSetLabel(t *testing.T) {
+	zone, store, fc, cl := hostSession(t)
+	var saved []clientconf.Config
+	c := newShareController("tanaka", []int{11434}, func(cf clientconf.Config) { saved = append(saved, cf) })
+	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: "free"})
+	c.setEndpoint("203.0.113.7:51820")
+
+	// 入力は LDH ラベルへ落として受け付ける。
+	if err := c.setLabel("Tanaka Note"); err != nil {
+		t.Fatalf("setLabel: %v", err)
+	}
+	host := netip.MustParseAddr("10.9.0.1")
+	if addr, ok := zone.Lookup("ollama.tanaka-note.mesh"); !ok || addr != host {
+		t.Errorf("新しい名前が解決しない: %v, %v", addr, ok)
+	}
+	// 旧名は解決しなくなる（Zone は当該アドレスの登録を置き換える）。
+	if _, ok := zone.Lookup("ollama.tanaka.mesh"); ok {
+		t.Error("旧名が残っている")
+	}
+	if snap := store.snapshot(); snap.MeshName != "tanaka-note.mesh" {
+		t.Errorf("MeshName = %q", snap.MeshName)
+	}
+	if len(fc.sent()) == 0 {
+		t.Error("名前の変更が再広告されていない")
+	}
+	if len(saved) != 1 || saved[0].MeshLabel != "tanaka-note" {
+		t.Fatalf("保存内容 = %+v", saved)
+	}
+	// 復元した共有の選択も一緒に保存される（次回起動でも同じサービスを貸せる）。
+	if len(saved[0].SharedPorts) != 1 || saved[0].SharedPorts[0] != 11434 {
+		t.Errorf("保存された共有の選択 = %v", saved[0].SharedPorts)
+	}
+
+	// ラベルにならない入力は拒否し、現在の名前を変えない。
+	for _, bad := range []string{"", "日本語のみ", "---"} {
+		if err := c.setLabel(bad); !errors.Is(err, errInvalidMeshLabel) {
+			t.Errorf("setLabel(%q) = %v, want errInvalidMeshLabel", bad, err)
+		}
+	}
+	if got := c.settings().MeshLabel; got != "tanaka-note" {
+		t.Errorf("拒否後のラベル = %q", got)
+	}
+	if len(saved) != 1 {
+		t.Errorf("拒否された変更が保存された: %+v", saved)
+	}
+}
+
+// TestShareControllerConcurrentEdits は GUI の操作（名前の変更・共有の更新・設定の閲覧）が
+// 並行しても状態が壊れないことを確かめる。排他の検証は CI の `-race` が担う。
+func TestShareControllerConcurrentEdits(t *testing.T) {
+	zone, store, _, cl := hostSession(t)
+	c := newShareController("tanaka", nil, func(clientconf.Config) {})
+	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Pro)})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(3)
+		go func(n int) { defer wg.Done(); _ = c.setLabel(fmt.Sprintf("host-%d", n)) }(i)
+		go func() { defer wg.Done(); _ = c.setPorts([]int{11434}) }()
+		go func() { defer wg.Done(); _ = c.settings() }()
+	}
+	wg.Wait()
+
+	// どの名前で決着するかは競合次第だが、publish は直列化されるため最後の適用は直近の状態に
+	// なる。ゾーンには自分のメッシュIP 向けの登録だけが残り、決着した名前が引ける。
+	host := netip.MustParseAddr("10.9.0.1")
+	entries := zone.Entries()
+	if len(entries) == 0 {
+		t.Fatal("ゾーンが空になった")
+	}
+	for _, e := range entries {
+		if e.Addr != host {
+			t.Errorf("%s = %v, want %v", e.Name, e.Addr, host)
+		}
+	}
+	got := c.settings()
+	if addr, ok := zone.Lookup(got.MeshName); !ok || addr != host {
+		t.Errorf("決着した名前 %q がゾーンと不整合: %v, %v", got.MeshName, addr, ok)
+	}
+}
+
+// TestShareControllerSettings は GUI へ返す設定ビューの内容を確かめる（保存無効時は persisted=false）。
+func TestShareControllerSettings(t *testing.T) {
+	c := newShareController("tanaka", []int{11434, 3000}, nil)
+	got := c.settings()
+	if got.MeshLabel != "tanaka" || got.MeshName != "tanaka.mesh" || got.Persisted {
+		t.Errorf("settings = %+v", got)
+	}
+	if len(got.Ports) != 2 || got.Ports[0] != 11434 {
+		t.Errorf("Ports = %v", got.Ports)
+	}
+	// 選択が無い場合も null ではなく空配列（JSON の扱いを揃える）。
+	if ports := newShareController("tanaka", nil, nil).settings().Ports; ports == nil {
+		t.Error("Ports が null になっている")
+	}
+	// 保存関数が無ければ persist は何もしない（パニックしない）。
+	c.persist()
 }
 
 // TestApplyPeerAdvertGuest はホストの広告をゲストが取り込む経路を確かめる（要件 §4.6.3）。
@@ -172,7 +299,7 @@ func TestApplyPeerAdvertGuest(t *testing.T) {
 			{Name: "bad_name.mesh", Port: 8080},             // 構文不正 → 無視
 		},
 	}
-	applyPeerAdvert(zone, store, "10.9.0.1", pi, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", pi, nil)
 
 	if addr, ok := zone.Lookup("ollama.tanaka.mesh"); !ok || addr != netip.MustParseAddr("10.9.0.1") {
 		t.Errorf("ゾーン = %v, %v", addr, ok)
@@ -190,7 +317,7 @@ func TestApplyPeerAdvertGuest(t *testing.T) {
 	}
 
 	// 名前を空にした再広告は登録を取り消す。
-	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{PubKey: "hostpk", WANEndpoint: "x"}, nil)
 	if _, ok := zone.Lookup("ollama.tanaka.mesh"); ok {
 		t.Error("再広告で登録が消えていない")
 	}
@@ -202,12 +329,12 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 	store := newViewStore()
 
 	// メッシュIP が不正なら何もしない。
-	applyPeerAdvert(zone, store, "not-an-ip", signaling.PeerInfo{Names: []string{"a.mesh"}}, true)
+	applyPeerAdvert(zone, store, "not-an-ip", signaling.PeerInfo{Names: []string{"a.mesh"}}, nil)
 	if len(zone.Entries()) != 0 {
 		t.Error("不正なIPで登録された")
 	}
 	// ゾーン外の名前は取り込まない。
-	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{Names: []string{"evil.example.com"}}, true)
+	applyPeerAdvert(zone, store, "10.9.0.1", signaling.PeerInfo{Names: []string{"evil.example.com"}}, nil)
 	if len(zone.Entries()) != 0 {
 		t.Error("ゾーン外の名前が登録された")
 	}
@@ -216,7 +343,7 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 	if err := zone.Replace(first, []string{"tanaka.mesh"}); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
-	applyPeerAdvert(zone, store, "10.9.0.3", signaling.PeerInfo{Names: []string{"tanaka.mesh"}}, false)
+	applyPeerAdvert(zone, nil, "10.9.0.3", signaling.PeerInfo{Names: []string{"tanaka.mesh"}}, nil)
 	if addr, _ := zone.Lookup("tanaka.mesh"); addr != first {
 		t.Errorf("名前が乗っ取られた: %v", addr)
 	}
@@ -225,7 +352,7 @@ func TestApplyPeerAdvertRejects(t *testing.T) {
 // TestShareControllerPlanLimit はプランの同時共有サービス数（§5・付録C.9 D-15）を守ることを確かめる。
 func TestShareControllerPlanLimit(t *testing.T) {
 	zone, store, _, cl := hostSession(t)
-	c := newShareController("tanaka")
+	c := newShareController("tanaka", nil, nil)
 	c.bind(shareSession{zone: zone, store: store, client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Free)})
 
 	free := plan.MustLookup(plan.Free).MaxSharedServices
@@ -244,12 +371,12 @@ func TestShareControllerPlanLimit(t *testing.T) {
 	}
 
 	// Pro はより多く貸せる。プラン不明（空文字）は無料プランへフェイルセーフ。
-	pro := newShareController("tanaka")
+	pro := newShareController("tanaka", nil, nil)
 	pro.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Pro)})
 	if err := pro.setPorts(over); err != nil {
 		t.Errorf("Pro で %d 件が拒否された: %v", len(over), err)
 	}
-	unknown := newShareController("tanaka")
+	unknown := newShareController("tanaka", nil, nil)
 	unknown.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: cl, pubKey: "hostPK", hostIP: "10.9.0.1", tier: ""})
 	if err := unknown.setPorts(over); !errors.Is(err, errShareLimit) {
 		t.Errorf("プラン不明は無料プラン扱いにすべき: %v", err)
@@ -259,7 +386,7 @@ func TestShareControllerPlanLimit(t *testing.T) {
 // TestShareControllerTruncatesOnBind はプラン確定時に、選択済みの超過分を決定的に切り詰めることを
 // 確かめる（上位プランで選んだあと無料プランのルームを作った場合など）。
 func TestShareControllerTruncatesOnBind(t *testing.T) {
-	c := newShareController("tanaka")
+	c := newShareController("tanaka", nil, nil)
 	free := plan.MustLookup(plan.Free).MaxSharedServices
 	ports := make([]int, free+2)
 	for i := range ports {
@@ -271,7 +398,7 @@ func TestShareControllerTruncatesOnBind(t *testing.T) {
 	if err := c.setPorts(ports); err != nil {
 		t.Fatalf("setPorts: %v", err)
 	}
-	// 次のセッションが無料プランなら、超過分は解除される（残るのは先頭から上限まで）。
+	// 次のセッションが無料プランなら、貸すのは先頭から上限までに絞られる。
 	c.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: nil, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Free)})
 	_, svcs := c.advert()
 	if len(svcs) != free {
@@ -281,5 +408,14 @@ func TestShareControllerTruncatesOnBind(t *testing.T) {
 		if sv.Port != ports[i] {
 			t.Errorf("svcs[%d].Port = %d, want %d（切り詰めは決定的であるべき）", i, sv.Port, ports[i])
 		}
+	}
+	// 選択そのものは保持しているため、再び Pro のセッションになれば全件戻る（保存済みの選択を
+	// 無料プランのセッション 1 回で失わせない・付録C.9 D-14）。
+	if got := c.settings().Ports; len(got) != len(ports) {
+		t.Errorf("保持している選択 = %v, want %d 件", got, len(ports))
+	}
+	c.bind(shareSession{zone: meshname.NewZone(), store: newViewStore(), client: nil, pubKey: "hostPK", hostIP: "10.9.0.1", tier: string(plan.Pro)})
+	if _, svcs := c.advert(); len(svcs) != len(ports) {
+		t.Errorf("Pro での共有数 = %d, want %d", len(svcs), len(ports))
 	}
 }

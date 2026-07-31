@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/originguard"
 	"github.com/instantmesh/instantmesh/pkg/qr"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
@@ -59,6 +60,11 @@ type guiOptions struct {
 	meshName   string        // メッシュ名のホストラベル（空なら OS のホスト名から導出）
 	useDNS     bool          // 共有サービスの名前解決を有効にする
 	shareGuard bool          // 共有していない宛先への到達を遮断する
+	loopback   bool          // 借りたサービスを自分の 127.0.0.1 へ出す（副の到達手段・§4.6.4）
+	// sharedPorts は保存済み設定から復元した共有の選択（付録C.9 D-14。無ければ nil）。
+	sharedPorts []int
+	// saveConf はメッシュ名・共有の選択をローカル設定へ書き出す関数（nil なら保存しない）。
+	saveConf func(clientconf.Config)
 }
 
 // guiServer は GUI 用の状態保持＋HTTP 配信＋セッション制御を担う。store は受信ループ（唯一の
@@ -110,7 +116,7 @@ func newGUIServer(baseCtx context.Context, opts guiOptions) *guiServer {
 		startHost:  runHost,
 		startGuest: runGuest,
 		probeDial:  dialTCP,
-		share:      newShareController(meshHostLabel(opts.meshName)),
+		share:      newShareController(meshHostLabel(opts.meshName), opts.sharedPorts, opts.saveConf),
 	}
 	s.touchHeartbeat()
 	return s
@@ -131,6 +137,8 @@ func (s *guiServer) handler() http.Handler {
 	mux.HandleFunc("POST /api/share", s.guard(s.handleShare))
 	mux.HandleFunc("GET /api/control", s.guard(s.handleControl))
 	mux.HandleFunc("POST /api/control", s.guard(s.handleControlUpdate))
+	mux.HandleFunc("GET /api/config", s.guard(s.handleConfig))
+	mux.HandleFunc("POST /api/config", s.guard(s.handleConfigUpdate))
 	mux.HandleFunc("POST /api/host", s.guard(s.handleHost))
 	mux.HandleFunc("POST /api/join", s.guard(s.handleJoin))
 	mux.HandleFunc("POST /api/approve", s.guard(s.handleApprove))
@@ -155,6 +163,12 @@ func (s *guiServer) guard(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// writeJSON は値を JSON で返す（200）。LocalAPI の応答はすべてこれを通す。
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 // handleIndex は埋め込み SPA を返す（"/" 以外のパスは 404）。
 func (s *guiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -169,8 +183,7 @@ func (s *guiServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 // 生存信号（ハートビート）とみなして時刻を更新し、途絶＝ブラウザが閉じられたと監視ゴルーチンが判定する。
 func (s *guiServer) handleState(w http.ResponseWriter, r *http.Request) {
 	s.touchHeartbeat()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.store.snapshot())
+	writeJSON(w, s.store.snapshot())
 }
 
 // handleQR は現在の招待リンクを QR コードの SVG 画像で返す（ホストの招待リンク表示用）。
@@ -207,8 +220,7 @@ func (s *guiServer) handleServices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ローカルサービスの検出に失敗しました", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"services": cands})
+	writeJSON(w, map[string]any{"services": cands})
 }
 
 // handleUsage は共有サービスの利用記録（要件 §4.7）を返す。閲覧は有料プラン限定（§5）で、
@@ -219,8 +231,7 @@ func (s *guiServer) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if records == nil {
 		records = []usage.Record{}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"available": ok, "records": records})
+	writeJSON(w, map[string]any{"available": ok, "records": records})
 }
 
 // handleShare は共有するローカルサービス（ポート集合）を設定する。body は {"ports": [11434, ...]}。
@@ -247,10 +258,35 @@ func (s *guiServer) handleShare(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleConfig はローカル設定（メッシュ名ラベル・共有の選択・保存の有効/無効）を返す
+// （付録C.9 D-14）。返すのは表示設定のみで、秘密鍵・トークンは載せない（設計原則2・3）。
+func (s *guiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.share.settings())
+}
+
+// handleConfigUpdate はメッシュ名ラベルを変更する。body は {"meshLabel": "tanaka"}。
+// 適用後の設定を返し、画面が即座に新しいホスト名を出せるようにする。
+//
+// 共有するポートの選択は POST /api/share が入口で（そちらも保存する）、ここでは扱わない。
+func (s *guiServer) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MeshLabel string `json:"meshLabel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "メッシュ名（meshLabel）が必要です", http.StatusBadRequest)
+		return
+	}
+	if err := s.share.setLabel(req.MeshLabel); err != nil {
+		slog.Warn("メッシュ名を変更できません", "err", err)
+		http.Error(w, "メッシュ名には英小文字・数字・ハイフンを使ってください", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, s.share.settings())
+}
+
 // handleControl は統制（アクセスキー・上限）の現在値を返す（要件 §4.7）。
 func (s *guiServer) handleControl(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(s.share.control())
+	writeJSON(w, s.share.control())
 }
 
 // handleControlUpdate は統制の操作をまとめて受ける（要件 §4.7・有料プラン機能）。
@@ -306,8 +342,7 @@ func (s *guiServer) handleControlUpdate(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // writeControlErr は統制操作の失敗を HTTP 応答へ写す。
@@ -374,7 +409,7 @@ func (s *guiServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	cfg := guestConfig{
 		inviteURL: req.Invite, nick: nick, useTunnel: s.opts.useTunnel,
 		ifname: s.opts.ifname, stunAddr: s.opts.stunAddr, relay: s.opts.relay,
-		useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard,
+		useDNS: s.opts.useDNS, shareGuard: s.opts.shareGuard, loopback: s.opts.loopback,
 	}
 	err := s.startSession(func(ctx context.Context) error {
 		return s.startGuest(ctx, cfg, s.store, s.setClient)

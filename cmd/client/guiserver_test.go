@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/instantmesh/instantmesh/pkg/appstate"
+	"github.com/instantmesh/instantmesh/pkg/clientconf"
 	"github.com/instantmesh/instantmesh/pkg/localsvc"
 	"github.com/instantmesh/instantmesh/pkg/signalclient"
 	"github.com/instantmesh/instantmesh/pkg/signaling"
@@ -109,6 +110,7 @@ func TestGUIServerOriginGuard(t *testing.T) {
 		{"POST", "/api/reject"}, {"POST", "/api/rotate"}, {"POST", "/api/leave"},
 		{"POST", "/api/reset"}, {"GET", "/api/state"}, {"GET", "/api/qr"},
 		{"GET", "/api/services"}, {"POST", "/api/share"}, {"GET", "/api/usage"}, {"GET", "/api/control"}, {"POST", "/api/control"},
+		{"GET", "/api/config"}, {"POST", "/api/config"},
 	} {
 		// 悪意サイトからの直接クロスオリジン fetch（Sec-Fetch-Site: cross-site）は 403。
 		if rec := req(ep.method, ep.path, loop, "https://evil.example", "cross-site"); rec.Code != http.StatusForbidden {
@@ -626,6 +628,88 @@ func TestGUIServerShare(t *testing.T) {
 	}
 	if _, svcs := gs.share.advert(); len(svcs) != 0 {
 		t.Errorf("共有を停止できていない: %+v", svcs)
+	}
+}
+
+// TestGUIServerConfig はローカル設定の取得と、GUI からのメッシュ名変更（付録C.9 D-14）を確かめる。
+func TestGUIServerConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var saved []clientconf.Config
+	gs := newGUIServer(ctx, guiOptions{
+		meshName: "tanaka", sharedPorts: []int{11434},
+		saveConf: func(c clientconf.Config) { saved = append(saved, c) },
+	})
+
+	// 起動時の設定（復元した共有の選択を含む）が読める。
+	rec := do(t, gs, "GET", "/api/config", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var view settingsView
+	if err := json.NewDecoder(rec.Body).Decode(&view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.MeshLabel != "tanaka" || view.MeshName != "tanaka.mesh" || !view.Persisted {
+		t.Errorf("view = %+v", view)
+	}
+	if !reflect.DeepEqual(view.Ports, []int{11434}) {
+		t.Errorf("Ports = %v, want [11434]（保存済みの選択を復元する）", view.Ports)
+	}
+
+	// 名前の変更は正規化して適用され、応答が適用後の設定を返す。
+	rec = do(t, gs, "POST", "/api/config", `{"meshLabel":"Tanaka Note"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.MeshLabel != "tanaka-note" || view.MeshName != "tanaka-note.mesh" {
+		t.Errorf("変更後 = %+v", view)
+	}
+	if len(saved) != 1 || saved[0].MeshLabel != "tanaka-note" || !reflect.DeepEqual(saved[0].SharedPorts, []int{11434}) {
+		t.Errorf("保存内容 = %+v", saved)
+	}
+
+	// ラベルにできない入力・壊れた body は 400 で、設定は変わらない。
+	for _, body := range []string{`{"meshLabel":"日本語のみ"}`, `{"meshLabel":""}`, "not-json"} {
+		if rec := do(t, gs, "POST", "/api/config", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status=%d, want 400", body, rec.Code)
+		}
+	}
+	if got := gs.share.settings().MeshLabel; got != "tanaka-note" {
+		t.Errorf("拒否された要求で名前が変わった: %q", got)
+	}
+	if len(saved) != 1 {
+		t.Errorf("拒否された要求で保存された: %+v", saved)
+	}
+
+	// 共有の選択も保存対象（POST /api/share 経由）。
+	if rec := do(t, gs, "POST", "/api/share", `{"ports":[3000]}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("share status=%d, want 204", rec.Code)
+	}
+	if len(saved) != 2 || !reflect.DeepEqual(saved[1].SharedPorts, []int{3000}) {
+		t.Errorf("共有の選択が保存されていない: %+v", saved)
+	}
+}
+
+// TestGUIServerConfigNoPersist は保存が無効（-config=）なとき、設定変更はセッション内で効くが
+// 保存はされないことを確かめる。
+func TestGUIServerConfigNoPersist(t *testing.T) {
+	gs, cancel := testServer(t)
+	defer cancel()
+
+	rec := do(t, gs, "POST", "/api/config", `{"meshLabel":"nagoya"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	view := gs.share.settings()
+	if view.MeshLabel != "nagoya" {
+		t.Errorf("MeshLabel = %q, want nagoya", view.MeshLabel)
+	}
+	if view.Persisted {
+		t.Error("保存関数が無いのに persisted=true になっている")
 	}
 }
 

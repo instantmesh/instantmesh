@@ -39,15 +39,14 @@ type forwarder struct {
 	conns     sync.Map // net.Conn → struct{}（解放時に確立済み接続も切るため）
 }
 
-// startForwarder は listen で待ち受け、接続を target へ中継する転送を開始する。
-func startForwarder(listen netip.AddrPort, target string, dial func(network, addr string) (net.Conn, error)) (*forwarder, error) {
-	ln, err := net.Listen("tcp", listen.String())
-	if err != nil {
-		return nil, err
-	}
+// newForwarder は既に確立済みのリスナーで転送を開始する。ゲスト側 loopback プロキシ（§4.6.4）は
+// 「bind できたポートをそのまま使う」形で空きを判定するため、リスナーを先に握ってから渡す
+// （確認してから bind し直す二段構えは、その間に他プロセスへ取られうる）。ホスト側も同じ形で、
+// 待受を開くのは serviceForwarder.open だけである。
+func newForwarder(ln net.Listener, target string, dial func(network, addr string) (net.Conn, error)) *forwarder {
 	f := &forwarder{ln: ln, target: target, dial: dial}
 	go f.accept()
-	return f, nil
+	return f
 }
 
 // addr は実際の待受アドレスを返す（ポート 0 指定時の確認用）。
@@ -117,14 +116,9 @@ func halfClose(c net.Conn) {
 // （bind 失敗が「使用中」かの判定 isAddrInUseErr は OS ごとにエラー値が異なるため
 // addrinuse_{windows,other}.go に置く。）
 
-// portListener は 1 共有サービス分の待受（生 TCP 転送 / HTTP プロキシ）。
-type portListener interface {
-	addr() net.Addr
-	close()
-}
-
-// serviceForwarder は共有中サービスぶんの転送をまとめて管理する。共有内容の変更で差分適用し、
-// 共有から外れたポートは直ちに解放する。
+// serviceForwarder は共有中サービスぶんの転送をまとめて管理する。待受の集合管理（差分適用・
+// 即時解放・全解放）は listenerSet が担い、ここは「メッシュIP の固定ポートで開く」方法だけを
+// 与える薄い層（ゲスト側 loopback プロキシも同じ器を使う）。
 //
 // gate が非 nil のときは生 TCP 転送ではなく HTTP プロキシとして待ち受け、ゲストごとのキーと
 // 上限を強制する（要件 §4.7・付録C.9 D-16）。この場合、共有できるのは HTTP のサービスに限られる。
@@ -137,12 +131,12 @@ type serviceForwarder struct {
 	// dial は転送先への接続（テストでフェイクへ差し替え可能）。
 	dial func(network, addr string) (net.Conn, error)
 
-	// gate は L7（HTTP）の統制層。nil なら生 TCP 転送のまま（統制なし）。
+	// gate は L7（HTTP）の統制層。nil なら生 TCP 転送のまま（統制なし）。requireKey 等の
+	// 設定変更は gate 自身が抱えるため、ここが握るのは「HTTP プロキシとして開くか」だけ。
 	gate *l7Gate
 
-	mu     sync.Mutex
-	active map[int]portListener
-	closed bool
+	set *listenerSet
+	mu  sync.Mutex // gate の読み書きを守る（待受の集合は listenerSet が守る）
 }
 
 // newServiceForwarder は指定アドレスで待ち受ける転送マネージャを返す。ctx 終了で全解放する。
@@ -151,31 +145,27 @@ func newServiceForwarder(ctx context.Context, addr netip.Addr) *serviceForwarder
 		addr:      addr,
 		targetFor: func(port int) string { return net.JoinHostPort("localhost", strconv.Itoa(port)) },
 		dial:      net.Dial,
-		active:    make(map[int]portListener),
 	}
-	go func() {
-		<-ctx.Done()
-		s.closeAll()
-	}()
+	s.set = newListenerSet(ctx, s.open)
 	return s
 }
 
-// setGate は L7 統制の有効/無効を切り替える。既存の待受は張り替えが要るため一度すべて閉じ、
-// 次の apply で開き直す（共有停止と同じ即時解放の経路を通る）。
+// setGate は L7 統制の有効/無効を切り替える。待受の性質そのものが変わる（生 TCP 転送 ⇄ HTTP
+// プロキシ）ため既存の待受を一度すべて閉じ、次の apply で開き直す。
+//
+// gate 自身の設定（キーを要求するか）の変更ではここを通らない —— l7Gate は長命な 1 個で、
+// 各リクエストが現在値を読むため待受の張り替えは不要。
 func (s *serviceForwarder) setGate(g *l7Gate) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	same := (s.gate == nil) == (g == nil)
+	changed := (s.gate == nil) != (g == nil)
 	s.gate = g
-	if !same {
-		for port, l := range s.active {
-			l.close()
-			delete(s.active, port)
-		}
-	}
 	s.mu.Unlock()
+	if changed {
+		s.set.closeAllListeners()
+	}
 }
 
 // apply は共有中ポート集合に合わせて転送を差分適用する（s が nil なら何もしない）。
@@ -183,52 +173,39 @@ func (s *serviceForwarder) apply(ports []int) {
 	if s == nil {
 		return
 	}
-	want := make(map[int]bool, len(ports))
-	for _, p := range ports {
-		want[p] = true
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return
-	}
-	// 共有から外れたものを直ちに解放する。
-	for port, f := range s.active {
-		if !want[port] {
-			f.close()
-			delete(s.active, port)
-			slog.Info("共有サービスの転送を停止しました", "port", port)
-		}
-	}
-	// 新たに共有されたものを開始する。
-	for _, port := range ports {
-		if _, ok := s.active[port]; ok {
-			continue
-		}
-		f, err := s.start(port)
-		if err != nil {
-			if isAddrInUseErr(err) {
-				// サービス自身が全アドレスで待ち受けている＝メッシュIP で直接到達できる。
-				slog.Info("既に全アドレスで待ち受けているため転送しません（直接到達できます）", "port", port)
-			} else {
-				slog.Warn("共有サービスの転送を開始できませんでした", "port", port, "err", err)
-			}
-			continue
-		}
-		s.active[port] = f
-		slog.Info("共有サービスの転送を開始しました",
-			"listen", f.addr().String(), "target", s.targetFor(port), "l7", s.gate != nil)
-	}
+	s.set.apply(ports)
 }
 
-// start は 1 ポート分の待受を開始する（呼び出し側でロック済みであること）。
-func (s *serviceForwarder) start(port int) (portListener, error) {
+// open は 1 ポート分の待受を開く（listenerSet が呼ぶ）。ホスト側はポート番号を保存するため
+// 候補を試さず、inUse も使わない（メッシュIP と localhost はアドレスが違うので衝突しない）。
+func (s *serviceForwarder) open(port int, _ func(int) bool) (portListener, int, error) {
+	s.mu.Lock()
+	gate := s.gate
+	s.mu.Unlock()
+
+	// 待受はここで 1 度だけ開き、性質（生 TCP 転送 / HTTP プロキシ）に応じて包む。bind の失敗は
+	// そのまま「サービス自身が全アドレスで待ち受けている」ことの判別を兼ねるため、開く場所と
+	// 意味づけを離さない。
 	listen := netip.AddrPortFrom(s.addr, uint16(port))
-	if s.gate != nil {
-		return startHTTPProxy(listen, s.targetFor(port), uint16(port), s.gate)
+	ln, err := net.Listen("tcp", listen.String())
+	if err != nil {
+		if isAddrInUseErr(err) {
+			// サービス自身が全アドレスで待ち受けている＝メッシュIP で直接到達できる。
+			slog.Info("既に全アドレスで待ち受けているため転送しません（直接到達できます）", "port", port)
+		} else {
+			slog.Warn("共有サービスの転送を開始できませんでした", "port", port, "err", err)
+		}
+		return nil, 0, err
 	}
-	return startForwarder(listen, s.targetFor(port), s.dial)
+	target := s.targetFor(port)
+	var l portListener
+	if gate != nil {
+		l = newHTTPProxy(ln, target, uint16(port), gate)
+	} else {
+		l = newForwarder(ln, target, s.dial)
+	}
+	slog.Info("共有サービスの転送を開始しました", "listen", l.addr().String(), "target", target, "l7", gate != nil)
+	return l, port, nil
 }
 
 // closeAll は全ての転送を解放する（ルーム解散・退出・プロセス終了時）。
@@ -236,11 +213,5 @@ func (s *serviceForwarder) closeAll() {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
-	for port, f := range s.active {
-		f.close()
-		delete(s.active, port)
-	}
+	s.set.closeAll()
 }

@@ -102,6 +102,10 @@ type SharedService struct {
 	Label string
 	Name  string // 到達名（FQDN・要件 §4.6.2 経路(1)）。名前解決を使わない場合は空
 	Addr  string // 共有元のメッシュIP（同 経路(2)）
+	// Local はゲスト側 loopback プロキシの待受ポート（同 経路(3)・§4.6.4）。0 なら当該経路は無効。
+	// 元ポートが埋まっていた場合は決定的に導出した代替ポートが入るため、UI は実際の値を出す
+	// 必要がある（§4.6.4: 実際の待受ポートを UI に明示する）。ホスト側では常に 0。
+	Local int
 }
 
 // Model は GUI が描画するアプリ状態一式。ゼロ値は使わず New で初期化する。
@@ -422,6 +426,10 @@ type SharedView struct {
 	URL string `json:"url,omitempty"`
 	// MeshURL はメッシュIP 直接の到達 URL（同 経路(2)。常に利用可能）。
 	MeshURL string `json:"meshUrl,omitempty"`
+	// LocalURL はゲスト側 loopback プロキシの到達 URL（同 経路(3)。待受が無ければ空）。
+	LocalURL string `json:"localUrl,omitempty"`
+	// LocalMoved は元ポートが埋まっていたため代替ポートで待ち受けていることを表す（§4.6.4）。
+	LocalMoved bool `json:"localMoved,omitempty"`
 }
 
 // GuestView は Snapshot 内のゲスト 1 名分。
@@ -471,16 +479,26 @@ func (m *Model) View() Snapshot {
 		s.Peers = append(s.Peers, PeerView{PubKey: p.PubKey, Route: p.Route.String()})
 	}
 	for _, sv := range m.Shared {
+		local := ""
+		if sv.Local != 0 {
+			local = serviceURL(loopbackHost, sv.Local)
+		}
 		s.Shared = append(s.Shared, SharedView{
-			Port:    sv.Port,
-			Label:   sv.Label,
-			Name:    sv.Name,
-			URL:     serviceURL(sv.Name, sv.Port),
-			MeshURL: serviceURL(sv.Addr, sv.Port),
+			Port:       sv.Port,
+			Label:      sv.Label,
+			Name:       sv.Name,
+			URL:        serviceURL(sv.Name, sv.Port),
+			MeshURL:    serviceURL(sv.Addr, sv.Port),
+			LocalURL:   local,
+			LocalMoved: sv.Local != 0 && sv.Local != sv.Port,
 		})
 	}
 	return s
 }
+
+// loopbackHost はゲスト側 loopback プロキシの到達ホスト。待受は `127.0.0.1` のみに限定し
+// （`0.0.0.0` にはバインドしない）、ゲストの LAN へ再露出させない（要件 §4.6.4）。
+const loopbackHost = "127.0.0.1"
 
 // serviceURL は到達 URL を組み立てる（host が空なら空文字）。UI が `http://` を含む完全な URL を
 // コピーできるようにするための組み立てで、未知TLD をブラウザが検索語として扱う問題を避ける
