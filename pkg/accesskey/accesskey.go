@@ -21,7 +21,6 @@ package accesskey
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 
 	"github.com/instantmesh/instantmesh/pkg/token"
@@ -93,20 +92,9 @@ func (r *Registry) Revoke(guest string) {
 	delete(r.byGuest, guest)
 }
 
-// Guests はキーを発行済みのゲスト一覧を昇順で返す（表示・テストの決定性のため）。
-func (r *Registry) Guests() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.byGuest))
-	for g := range r.byGuest {
-		out = append(out, g)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // Snapshot は発行済みのゲスト → キーの対応を複製して返す（表示・配布用）。
-// 1 回のロックで全件を写すため、呼び出し側が Guests と KeyFor を組み合わせる必要はない。
+// 1 回のロックで全件を写すため、呼び出し側がゲストを列挙して KeyFor を引き直す必要はない
+// （並び順が要るなら呼び出し側で決める。表示の並びはゲスト一覧側の順序に従う）。
 func (r *Registry) Snapshot() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

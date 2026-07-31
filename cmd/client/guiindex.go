@@ -397,62 +397,52 @@ function screenHTML(s) {
   }
 }
 
-function wire(s) {
-  var h = document.getElementById('btn-host');
-  if (h) h.onclick = function() {
+// onClick は id の要素があれば操作を結び付ける（画面ごとに存在しないボタンがあるため）。
+function onClick(id, fn) {
+  var el = document.getElementById(id);
+  if (el) el.onclick = fn;
+}
+
+// onEach は data 属性を持つ全要素へ操作を結び付け、その属性値と要素を渡す（行ごとのボタン用）。
+// 要素の束縛はコールバックの引数に閉じるため、呼び出し側で IIFE を書く必要はない。
+function onEach(attr, event, fn) {
+  Array.prototype.forEach.call(document.querySelectorAll('[' + attr + ']'), function(el) {
+    el[event] = function() { fn(el.getAttribute(attr), el); };
+  });
+}
+
+// wire は描き直した DOM へ操作を結び付ける。参照するのはグローバルな取得済みデータ
+// （selected・control）だけで、表示状態そのものは HTML 側に描き込まれている。
+function wire() {
+  onClick('btn-host', function() {
     var v = parseInt(document.getElementById('dur').value, 10);
     post('/api/host', {duration: isNaN(v) ? 0 : v});
-  };
-  var j = document.getElementById('btn-join');
-  if (j) j.onclick = function() {
+  });
+  onClick('btn-join', function() {
     post('/api/join', {invite: document.getElementById('inv').value.trim(), nick: document.getElementById('nick').value.trim()});
-  };
-  var cp = document.getElementById('btn-copy');
-  if (cp) cp.onclick = function() {
+  });
+  onClick('btn-copy', function() {
     var el = document.getElementById('link');
     el.select();
     if (navigator.clipboard) navigator.clipboard.writeText(el.value);
-  };
-  var rt = document.getElementById('btn-rotate');
-  if (rt) rt.onclick = function() { post('/api/rotate'); };
-  var lv = document.getElementById('btn-leave');
-  if (lv) lv.onclick = function() { post('/api/leave'); };
-  var rs = document.getElementById('btn-restart');
-  if (rs) rs.onclick = function() { post('/api/reset'); };
-  var rc = document.getElementById('btn-rescan');
-  if (rc) rc.onclick = function() { loadServices(); };
-  var sh = document.getElementById('btn-share');
-  if (sh) sh.onclick = function() {
+  });
+  onClick('btn-rotate', function() { post('/api/rotate'); });
+  onClick('btn-leave', function() { post('/api/leave'); });
+  onClick('btn-restart', function() { post('/api/reset'); });
+  onClick('btn-rescan', function() { loadServices(); });
+  onClick('btn-share', function() {
     var ports = [];
     for (var p in selected) { if (selected[p]) ports.push(parseInt(p, 10)); }
     post('/api/share', {ports: ports});
-  };
-  var nm = document.getElementById('btn-name');
-  if (nm) nm.onclick = function() { saveMeshName(document.getElementById('mesh-label').value.trim()); };
-  var rk = document.getElementById('btn-require-key');
-  if (rk) rk.onclick = function() { postControl({requireKey: !(control && control.requireKey)}); };
-  var iks = document.querySelectorAll('[data-issue-key]');
-  for (var q = 0; q < iks.length; q++) (function(b) {
-    b.onclick = function() { postControl({issueKey: b.getAttribute('data-issue-key')}); };
-  })(iks[q]);
-  var rks = document.querySelectorAll('[data-revoke-key]');
-  for (var w = 0; w < rks.length; w++) (function(b) {
-    b.onclick = function() { postControl({revokeKey: b.getAttribute('data-revoke-key')}); };
-  })(rks[w]);
-  var cbs = document.querySelectorAll('[data-port]');
-  for (var m = 0; m < cbs.length; m++) (function(b) {
-    b.onchange = function() { selected[b.getAttribute('data-port')] = b.checked; };
-  })(cbs[m]);
-  var cus = document.querySelectorAll('[data-copy]');
-  for (var n = 0; n < cus.length; n++) (function(b) {
-    b.onclick = function() {
-      if (navigator.clipboard) navigator.clipboard.writeText(b.getAttribute('data-copy'));
-    };
-  })(cus[n]);
-  var els = document.querySelectorAll('[data-approve]');
-  for (var i = 0; i < els.length; i++) (function(b) { b.onclick = function() { post('/api/approve', {pubKey: b.getAttribute('data-approve')}); }; })(els[i]);
-  els = document.querySelectorAll('[data-reject]');
-  for (var k = 0; k < els.length; k++) (function(b) { b.onclick = function() { post('/api/reject', {pubKey: b.getAttribute('data-reject')}); }; })(els[k]);
+  });
+  onClick('btn-name', function() { saveMeshName(document.getElementById('mesh-label').value.trim()); });
+  onClick('btn-require-key', function() { postControl({requireKey: !(control && control.requireKey)}); });
+  onEach('data-issue-key', 'onclick', function(v) { postControl({issueKey: v}); });
+  onEach('data-revoke-key', 'onclick', function(v) { postControl({revokeKey: v}); });
+  onEach('data-port', 'onchange', function(v, el) { selected[v] = el.checked; });
+  onEach('data-copy', 'onclick', function(v) { if (navigator.clipboard) navigator.clipboard.writeText(v); });
+  onEach('data-approve', 'onclick', function(v) { post('/api/approve', {pubKey: v}); });
+  onEach('data-reject', 'onclick', function(v) { post('/api/reject', {pubKey: v}); });
 }
 
 // render は表示状態を描画する。text はサーバーから受け取った s の生 JSON（あれば）で、
@@ -476,7 +466,7 @@ function render(s, text) {
   if (sig === lastSig) return;
   lastSig = sig;
   app.innerHTML = s.phase === 'idle' ? idleHTML() : screenHTML(s);
-  wire(s);
+  wire();
 }
 
 async function poll() {

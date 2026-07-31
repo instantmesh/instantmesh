@@ -51,17 +51,6 @@ var ErrInvalidPort = errors.New("portmap: port out of range")
 // 「同じホストなら同じポート」を保証できない。
 var ErrNoHostKey = errors.New("portmap: host public key is required")
 
-// Mapping は 1 サービス分のポート写像。
-//
-// 「元ポートから退避したか」（UI が明示すべき事実・§4.6.4）は Local != Port そのものなので
-// 別のフィールドには持たせない。表示側（pkg/appstate）が同じ規則で導出する。
-type Mapping struct {
-	// Port は共有元（ホスト側）のポート番号。
-	Port int `json:"port"`
-	// Local はゲストの `127.0.0.1` で実際に待ち受けるポート番号。
-	Local int `json:"local"`
-}
-
 // Derive は元ポートに対する代替ポートを決定的に導出する（要件 §4.6.4）。
 //
 //	Base + SHA256(hostKey ‖ 0x00 ‖ port) mod Span
@@ -103,40 +92,6 @@ func Candidates(hostKey string, port int) ([]int, error) {
 	add(port)
 	for i := 0; i < MaxProbe; i++ {
 		add(Base + (derived-Base+i)%Span)
-	}
-	return out, nil
-}
-
-// Assign は借りるポート集合に対する写像を決める。claim は「そのポートを確保できたか」を返す
-// 述語で、cmd/client が実際の bind 試行を渡す（本パッケージは I/O を持たない）。
-//
-// 候補は Candidates の順で試し、最初に確保できたものを採る。1 回の Assign 内で既に割り当てた
-// ポートは他のサービスへ再利用しない（claim の副作用に依存せず自前でも重複を避ける）。
-// どの候補も確保できなかったサービスは戻り値に含めない——待受が無いことを呼び出し側が
-// 「その1件だけ利用できない」として扱えるようにするため（他のサービスは使える）。
-//
-// 並び順は ports の入力順を保つ（表示とテストの決定性のため）。ports 内の重複は 1 件に畳む。
-func Assign(hostKey string, ports []int, claim func(port int) bool) ([]Mapping, error) {
-	out := make([]Mapping, 0, len(ports))
-	taken := make(map[int]bool, len(ports))
-	done := make(map[int]bool, len(ports))
-	for _, port := range ports {
-		if done[port] {
-			continue
-		}
-		done[port] = true
-		cands, err := Candidates(hostKey, port)
-		if err != nil {
-			return nil, err
-		}
-		for _, c := range cands {
-			if taken[c] || !claim(c) {
-				continue
-			}
-			taken[c] = true
-			out = append(out, Mapping{Port: port, Local: c})
-			break
-		}
 	}
 	return out, nil
 }

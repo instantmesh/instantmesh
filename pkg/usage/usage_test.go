@@ -34,11 +34,6 @@ func TestRecordAndSnapshot(t *testing.T) {
 	if got[2].Peer != "10.0.0.3" {
 		t.Errorf("got[2] = %+v", got[2])
 	}
-
-	in, out := r.Totals()
-	if in != 115 || out != 900 {
-		t.Errorf("Totals = %d / %d, want 115 / 900", in, out)
-	}
 }
 
 // TestIgnoresUnidentifiable は計上単位を特定できない入力を記録しないことを確かめる。
@@ -70,10 +65,6 @@ func TestForgetAndReset(t *testing.T) {
 	r.Reset()
 	if len(r.Snapshot()) != 0 {
 		t.Error("Reset 後も記録が残っている")
-	}
-	in, out := r.Totals()
-	if in != 0 || out != 0 {
-		t.Errorf("Reset 後の合計 = %d / %d", in, out)
 	}
 }
 

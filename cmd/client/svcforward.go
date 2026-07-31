@@ -39,18 +39,10 @@ type forwarder struct {
 	conns     sync.Map // net.Conn → struct{}（解放時に確立済み接続も切るため）
 }
 
-// startForwarder は listen で待ち受け、接続を target へ中継する転送を開始する。
-func startForwarder(listen netip.AddrPort, target string, dial func(network, addr string) (net.Conn, error)) (*forwarder, error) {
-	ln, err := net.Listen("tcp", listen.String())
-	if err != nil {
-		return nil, err
-	}
-	return newForwarder(ln, target, dial), nil
-}
-
 // newForwarder は既に確立済みのリスナーで転送を開始する。ゲスト側 loopback プロキシ（§4.6.4）は
 // 「bind できたポートをそのまま使う」形で空きを判定するため、リスナーを先に握ってから渡す
-// （確認してから bind し直す二段構えは、その間に他プロセスへ取られうる）。
+// （確認してから bind し直す二段構えは、その間に他プロセスへ取られうる）。ホスト側も同じ形で、
+// 待受を開くのは serviceForwarder.open だけである。
 func newForwarder(ln net.Listener, target string, dial func(network, addr string) (net.Conn, error)) *forwarder {
 	f := &forwarder{ln: ln, target: target, dial: dial}
 	go f.accept()
@@ -191,17 +183,11 @@ func (s *serviceForwarder) open(port int, _ func(int) bool) (portListener, int, 
 	gate := s.gate
 	s.mu.Unlock()
 
+	// 待受はここで 1 度だけ開き、性質（生 TCP 転送 / HTTP プロキシ）に応じて包む。bind の失敗は
+	// そのまま「サービス自身が全アドレスで待ち受けている」ことの判別を兼ねるため、開く場所と
+	// 意味づけを離さない。
 	listen := netip.AddrPortFrom(s.addr, uint16(port))
-	target := s.targetFor(port)
-	var (
-		l   portListener
-		err error
-	)
-	if gate != nil {
-		l, err = startHTTPProxy(listen, target, uint16(port), gate)
-	} else {
-		l, err = startForwarder(listen, target, s.dial)
-	}
+	ln, err := net.Listen("tcp", listen.String())
 	if err != nil {
 		if isAddrInUseErr(err) {
 			// サービス自身が全アドレスで待ち受けている＝メッシュIP で直接到達できる。
@@ -210,6 +196,13 @@ func (s *serviceForwarder) open(port int, _ func(int) bool) (portListener, int, 
 			slog.Warn("共有サービスの転送を開始できませんでした", "port", port, "err", err)
 		}
 		return nil, 0, err
+	}
+	target := s.targetFor(port)
+	var l portListener
+	if gate != nil {
+		l = newHTTPProxy(ln, target, uint16(port), gate)
+	} else {
+		l = newForwarder(ln, target, s.dial)
 	}
 	slog.Info("共有サービスの転送を開始しました", "listen", l.addr().String(), "target", target, "l7", gate != nil)
 	return l, port, nil

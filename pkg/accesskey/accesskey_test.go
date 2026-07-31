@@ -77,23 +77,20 @@ func TestIssueGenerationError(t *testing.T) {
 	}
 }
 
-func TestGuestsAndReset(t *testing.T) {
+func TestSnapshotAndReset(t *testing.T) {
 	r := New()
-	for _, g := range []string{"bob", "alice"} {
+	guests := []string{"bob", "alice"}
+	for _, g := range guests {
 		if _, err := r.Issue(g); err != nil {
 			t.Fatalf("Issue: %v", err)
 		}
-	}
-	got := r.Guests()
-	if len(got) != 2 || got[0] != "alice" || got[1] != "bob" {
-		t.Errorf("Guests = %v（昇順であるべき）", got)
 	}
 	// Snapshot は 1 回のロックで全件を写す（表示・配布用）。
 	snap := r.Snapshot()
 	if len(snap) != 2 {
 		t.Fatalf("Snapshot = %v, want 2 件", snap)
 	}
-	for _, g := range got {
+	for _, g := range guests {
 		if k, ok := r.KeyFor(g); !ok || snap[g] != k {
 			t.Errorf("Snapshot[%q] = %q, want %q", g, snap[g], k)
 		}
@@ -105,7 +102,7 @@ func TestGuestsAndReset(t *testing.T) {
 	}
 
 	r.Reset()
-	if len(r.Guests()) != 0 || len(r.Snapshot()) != 0 {
+	if len(r.Snapshot()) != 0 {
 		t.Error("Reset 後もキーが残っている")
 	}
 }

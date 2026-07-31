@@ -2,7 +2,6 @@ package portmap
 
 import (
 	"errors"
-	"reflect"
 	"strconv"
 	"testing"
 )
@@ -166,115 +165,5 @@ func TestCandidatesWrapsWithinRange(t *testing.T) {
 	}
 	if !wrapped {
 		t.Errorf("鍵 %q（導出 %d）で巻き戻りが起きていない", key, derived)
-	}
-}
-
-// TestAssignKeepsPort は元ポートが空いていればそれを使うことを確かめる（ポート保存）。
-func TestAssignKeepsPort(t *testing.T) {
-	got, err := Assign(hostKey, []int{11434, 3000}, func(int) bool { return true })
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	want := []Mapping{{Port: 11434, Local: 11434}, {Port: 3000, Local: 3000}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Assign = %+v, want %+v", got, want)
-	}
-}
-
-// TestAssignFallsBackDeterministically は元ポートが埋まっていると導出ポートへ退避し、その値が
-// 毎回同じであることを確かめる（§4.6.4）。
-func TestAssignFallsBackDeterministically(t *testing.T) {
-	busy := map[int]bool{11434: true}
-	claim := func(p int) bool { return !busy[p] }
-
-	first, err := Assign(hostKey, []int{11434}, claim)
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if len(first) != 1 || first[0].Local == first[0].Port {
-		t.Fatalf("Assign = %+v, want 退避 1 件", first)
-	}
-	derived, err := Derive(hostKey, 11434)
-	if err != nil {
-		t.Fatalf("Derive: %v", err)
-	}
-	if first[0].Local != derived {
-		t.Errorf("退避先 = %d, want %d", first[0].Local, derived)
-	}
-	// 再実行（セッションをまたぐ想定）でも同じ値になる。
-	again, err := Assign(hostKey, []int{11434}, claim)
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if !reflect.DeepEqual(again, first) {
-		t.Errorf("再実行で変わった: %+v → %+v", first, again)
-	}
-
-	// 導出ポートも埋まっていれば線形探索へ進む。
-	busy[derived] = true
-	next, err := Assign(hostKey, []int{11434}, claim)
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if len(next) != 1 || next[0].Local != derived+1 {
-		t.Errorf("Assign = %+v, want Local=%d", next, derived+1)
-	}
-}
-
-// TestAssignAvoidsSelfCollision は 1 回の Assign 内で同じ待受ポートを二重に使わないことを
-// 確かめる（導出ポートが別サービスの元ポートと衝突する場合）。
-func TestAssignAvoidsSelfCollision(t *testing.T) {
-	derived, err := Derive(hostKey, 11434)
-	if err != nil {
-		t.Fatalf("Derive: %v", err)
-	}
-	// 11434 は埋まっているため derived へ退避する。同じ derived を元ポートに持つ 2 件目は
-	// 先に取られているため、その次の候補へ回る。
-	busy := map[int]bool{11434: true}
-	got, err := Assign(hostKey, []int{11434, derived}, func(p int) bool { return !busy[p] })
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("Assign = %+v, want 2 件", got)
-	}
-	if got[0].Local != derived {
-		t.Errorf("1 件目 = %d, want %d", got[0].Local, derived)
-	}
-	if got[1].Local == got[0].Local {
-		t.Errorf("待受ポートが重複した: %d", got[1].Local)
-	}
-}
-
-// TestAssignSkipsUnavailable は全候補が埋まっているサービスを結果へ含めないことを確かめる
-// （その 1 件だけ利用できない扱いにし、他のサービスは使えるようにする）。
-func TestAssignSkipsUnavailable(t *testing.T) {
-	got, err := Assign(hostKey, []int{11434, 3000}, func(p int) bool { return p == 3000 })
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if len(got) != 1 || got[0].Port != 3000 {
-		t.Errorf("Assign = %+v, want 3000 のみ", got)
-	}
-}
-
-// TestAssignDedupesAndValidates は入力の重複を畳み、不正なポートを弾くことを確かめる。
-func TestAssignDedupesAndValidates(t *testing.T) {
-	got, err := Assign(hostKey, []int{11434, 11434}, func(int) bool { return true })
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if len(got) != 1 {
-		t.Errorf("Assign = %+v, want 1 件（重複を畳む）", got)
-	}
-	if _, err := Assign(hostKey, []int{0}, func(int) bool { return true }); !errors.Is(err, ErrInvalidPort) {
-		t.Errorf("err = %v, want ErrInvalidPort", err)
-	}
-	if _, err := Assign("", []int{11434}, func(int) bool { return true }); !errors.Is(err, ErrNoHostKey) {
-		t.Errorf("err = %v, want ErrNoHostKey", err)
-	}
-	// 空入力は空の結果（nil ではなく長さ 0）。
-	if got, err := Assign(hostKey, nil, func(int) bool { return true }); err != nil || len(got) != 0 {
-		t.Errorf("Assign(nil) = %+v, %v", got, err)
 	}
 }

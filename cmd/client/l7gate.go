@@ -104,12 +104,12 @@ type httpProxy struct {
 	srv *http.Server
 }
 
-// startHTTPProxy は listen で待ち受け、gate を通した要求だけを target へ中継する。
-func startHTTPProxy(listen netip.AddrPort, target string, port uint16, gate *l7Gate) (*httpProxy, error) {
-	ln, err := net.Listen("tcp", listen.String())
-	if err != nil {
-		return nil, err
-	}
+// newHTTPProxy は ln で受けた要求を gate に通し、通ったものだけを target へ中継する。
+//
+// 待受は呼び出し側が開いてから渡す（生 TCP 転送の newForwarder と同じ形）。bind をここに持たない
+// のは、bind の失敗が「サービス自身が全アドレスで待ち受けている」ことの判別を兼ねており、その
+// 意味づけを待受を開く側（serviceForwarder.open）へ 1 箇所に寄せているため。
+func newHTTPProxy(ln net.Listener, target string, port uint16, gate *l7Gate) *httpProxy {
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(&url.URL{Scheme: "http", Host: target})
@@ -139,7 +139,7 @@ func startHTTPProxy(listen netip.AddrPort, target string, port uint16, gate *l7G
 	})
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
-	return &httpProxy{ln: ln, srv: srv}, nil
+	return &httpProxy{ln: ln, srv: srv}
 }
 
 // addr は実際の待受アドレスを返す。

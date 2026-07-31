@@ -189,17 +189,6 @@ func (r *Recorder) Snapshot() []Record {
 	return out
 }
 
-// Totals は全体の合計（受信・送信バイト）を返す。
-func (r *Recorder) Totals() (in, out int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.entries {
-		in += e.in
-		out += e.out
-	}
-	return in, out
-}
-
 // Forget は指定ピアの記録を消す（キック・離脱で記録を残さない運用にする場合に使う）。
 func (r *Recorder) Forget(peer netip.Addr) {
 	r.mu.Lock()

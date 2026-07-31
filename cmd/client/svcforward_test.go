@@ -36,14 +36,22 @@ func echoService(t *testing.T) net.Listener {
 	return ln
 }
 
+// testForwarder は 127.0.0.1 の空きポートで待受を開き、target へ中継する転送を返す
+// （本番で待受を開くのは serviceForwarder.open だけなので、テスト側で bind する）。
+func testForwarder(t *testing.T, target string) *forwarder {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return newForwarder(ln, target, net.Dial)
+}
+
 // TestForwarderRelays は待受→転送先の双方向中継が成立することを確かめる
 // （ホスト側の「メッシュIP:ポート → 127.0.0.1:ポート」と同じ経路。要件 §4.6.2 の前提）。
 func TestForwarderRelays(t *testing.T) {
 	svc := echoService(t)
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), svc.Addr().String(), net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, svc.Addr().String())
 	defer f.close()
 
 	c, err := net.Dial("tcp", f.addr().String())
@@ -69,10 +77,7 @@ func TestForwarderRelays(t *testing.T) {
 // （ホストが元ポートを占有し続けないこと・要件 §4.6.4 の即時解放）。
 func TestForwarderCloseReleasesPort(t *testing.T) {
 	svc := echoService(t)
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), svc.Addr().String(), net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, svc.Addr().String())
 	addr := f.addr().String()
 	// 確立済み接続がある状態で閉じても、リスナーと接続の双方が解放される。
 	c, err := net.Dial("tcp", addr)
@@ -96,10 +101,7 @@ func TestForwarderTargetUnreachable(t *testing.T) {
 	target := dead.Addr().String()
 	_ = dead.Close()
 
-	f, err := startForwarder(netip.MustParseAddrPort("127.0.0.1:0"), target, net.Dial)
-	if err != nil {
-		t.Fatalf("startForwarder: %v", err)
-	}
+	f := testForwarder(t, target)
 	defer f.close()
 
 	c, err := net.Dial("tcp", f.addr().String())

@@ -87,6 +87,17 @@ func TestGateCheck(t *testing.T) {
 	}
 }
 
+// testHTTPProxy は 127.0.0.1 の空きポートで待受を開き、gate を通した要求を target へ中継する
+// プロキシを返す（本番で待受を開くのは serviceForwarder.open だけなので、テスト側で bind する）。
+func testHTTPProxy(t *testing.T, target string, gate *l7Gate) *httpProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return newHTTPProxy(ln, target, 11434, gate)
+}
+
 // TestHTTPProxyEnforces は実 HTTP でキー要求と中継が機能することを確かめる。
 func TestHTTPProxyEnforces(t *testing.T) {
 	// 共有サービスに見立てた上流。
@@ -105,10 +116,7 @@ func TestHTTPProxyEnforces(t *testing.T) {
 	gate.setRequireKey(true)
 
 	target := strings.TrimPrefix(upstream.URL, "http://")
-	p, err := startHTTPProxy(netip.MustParseAddrPort("127.0.0.1:0"), target, 11434, gate)
-	if err != nil {
-		t.Fatalf("startHTTPProxy: %v", err)
-	}
+	p := testHTTPProxy(t, target, gate)
 	defer p.close()
 
 	base := "http://" + p.addr().String()
@@ -164,10 +172,7 @@ func TestHTTPProxyRequireKeyTakesEffectLive(t *testing.T) {
 	keys := accesskey.New()
 	rec := usage.New()
 	gate := &l7Gate{keys: keys, rec: rec, now: time.Now} // キー要求は無効で開始
-	p, err := startHTTPProxy(netip.MustParseAddrPort("127.0.0.1:0"), strings.TrimPrefix(upstream.URL, "http://"), 11434, gate)
-	if err != nil {
-		t.Fatalf("startHTTPProxy: %v", err)
-	}
+	p := testHTTPProxy(t, strings.TrimPrefix(upstream.URL, "http://"), gate)
 	defer p.close()
 
 	base := "http://" + p.addr().String() + "/api/tags"
